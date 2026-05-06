@@ -2,22 +2,20 @@
 // boss-pdf · client
 // ============================================================
 
-// pdf.js worker
 if (window.pdfjsLib) {
   pdfjsLib.GlobalWorkerOptions.workerSrc =
     "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 }
 
-// chunk colors (cycled)
-const CHUNK_COLORS = [
-  "#d4a64a", // gold
-  "#5fdfb0", // teal
+const SECTION_COLORS = [
+  "#c9a15a", // gold
+  "#5fdfb0", // mint
   "#6aa7ff", // blue
   "#ff89d2", // pink
-  "#f48a4d", // orange
+  "#f48a4d", // amber
   "#b388ff", // violet
   "#9be36b", // lime
-  "#ff6f6f", // red
+  "#ef6f6f", // red
 ];
 
 // ---------- DOM refs ----------
@@ -34,7 +32,8 @@ const converterEl = document.getElementById("converter");
 const convName = document.getElementById("convName");
 const convPages = document.getElementById("convPages");
 const convSummary = document.getElementById("convSummary");
-const convQuick = document.getElementById("convQuick");
+const convFrom = document.getElementById("convFrom");
+const convTo = document.getElementById("convTo");
 const convThumbs = document.getElementById("convThumbs");
 const convertBtn = document.getElementById("convertBtn");
 const convBack = document.getElementById("convBack");
@@ -42,8 +41,8 @@ const convBack = document.getElementById("convBack");
 const splitterEl = document.getElementById("splitter");
 const splitName = document.getElementById("splitName");
 const splitPages = document.getElementById("splitPages");
-const chunkBar = document.getElementById("chunkBar");
-const addChunkBtn = document.getElementById("addChunkBtn");
+const sectionListEl = document.getElementById("sectionList");
+const addSectionBtn = document.getElementById("addSectionBtn");
 const autoSplitBtn = document.getElementById("autoSplitBtn");
 const splitSummary = document.getElementById("splitSummary");
 const splitThumbs = document.getElementById("splitThumbs");
@@ -72,12 +71,11 @@ const retryBtn = document.getElementById("retryBtn");
 // ---------- State ----------
 let currentFile = null;
 let pageCount = 0;
-let pdfDoc = null;          // cached pdfjs doc for thumbnails
-let pdfDocFile = null;      // file the doc was built from
+let pdfDoc = null;
+let pdfDocFile = null;
 
 const convSelected = new Set();
-let chunks = [];            // [{color, pages: Set<int>}]
-let activeChunkIdx = 0;
+let sections = []; // [{ from, to, color }]
 
 const ALL_CARDS = [chooserEl, converterEl, splitterEl, statusEl, resultEl, splitResultEl, errorEl];
 
@@ -102,10 +100,10 @@ function resetAll() {
   pdfDoc = null;
   pdfDocFile = null;
   convSelected.clear();
-  chunks = [];
-  activeChunkIdx = 0;
+  sections = [];
   convThumbs.innerHTML = "";
   splitThumbs.innerHTML = "";
+  sectionListEl.innerHTML = "";
 }
 
 function showError(message) {
@@ -113,7 +111,6 @@ function showError(message) {
   showOnly(errorEl);
 }
 
-// Compress {1,2,3,5,8,9} -> "1-3,5,8-9"
 function compressPages(set) {
   const sorted = [...set].sort((a, b) => a - b);
   if (!sorted.length) return "";
@@ -126,27 +123,6 @@ function compressPages(set) {
   }
   groups.push(start === prev ? `${start}` : `${start}-${prev}`);
   return groups.join(",");
-}
-
-// Parse "1-3,5,8-10" -> Set<int>, clamped to [1, pageCount]
-function parsePageSpec(spec) {
-  const out = new Set();
-  if (!spec) return out;
-  const parts = spec.split(",");
-  for (const part of parts) {
-    const p = part.trim();
-    if (!p) continue;
-    if (p.includes("-")) {
-      const [a, b] = p.split("-").map(s => parseInt(s.trim(), 10));
-      if (!a || !b || a < 1 || b < a || b > pageCount) return null;
-      for (let i = a; i <= b; i++) out.add(i);
-    } else {
-      const n = parseInt(p, 10);
-      if (!n || n < 1 || n > pageCount) return null;
-      out.add(n);
-    }
-  }
-  return out;
 }
 
 // ---------- Drag/drop ----------
@@ -175,18 +151,18 @@ dropzone.addEventListener("drop", e => {
 // ---------- Step 1: receive file ----------
 async function handleFile(file) {
   if (!file.name.toLowerCase().endsWith(".pdf")) {
-    showError("That doesn't look like a .pdf file. The Boss only does PDFs.");
+    showError("That doesn't look like a .pdf. The boss only does PDFs.");
     return;
   }
   if (file.size > 50 * 1024 * 1024) {
-    showError("File is over 50 MB. The Boss has standards.");
+    showError("File is over 50 MB. The boss has standards.");
     return;
   }
   currentFile = file;
 
   fileNameEl.textContent = file.name;
   fileSizeEl.textContent = fmtSize(file.size);
-  statusMsg.textContent = "The Boss is sizing up your file…";
+  statusMsg.textContent = "The boss is sizing up your file…";
   progressBar.style.width = "0%";
   progressBar.classList.add("indeterminate");
   showOnly(statusEl);
@@ -211,7 +187,7 @@ async function handleFile(file) {
 // ---------- Step 2: chooser ----------
 function showChooser() {
   chooserName.textContent = currentFile.name;
-  chooserPages.textContent = `${pageCount} page${pageCount === 1 ? "" : "s"} • ${fmtSize(currentFile.size)}`;
+  chooserPages.textContent = `${pageCount} page${pageCount === 1 ? "" : "s"} · ${fmtSize(currentFile.size)}`;
   showOnly(chooserEl);
 }
 document.querySelectorAll(".tool-card").forEach(btn => {
@@ -252,13 +228,11 @@ async function renderThumbnails(file, container, onTileClick, decorate) {
       <div class="thumb"><div class="thumb-skel"></div></div>
       <div class="page-num">${i}</div>
     `;
-    tile.addEventListener("click", () => onTileClick(i, tile));
+    if (onTileClick) tile.addEventListener("click", () => onTileClick(i, tile));
     container.appendChild(tile);
     tiles.push(tile);
   }
-  // decorate immediately if a state already exists (e.g. select-all on open)
   if (decorate) decorate(tiles);
-  // render canvases progressively
   for (let i = 1; i <= pdf.numPages; i++) {
     try {
       const page = await pdf.getPage(i);
@@ -275,40 +249,38 @@ async function renderThumbnails(file, container, onTileClick, decorate) {
       const thumb = tiles[i - 1].querySelector(".thumb");
       thumb.innerHTML = "";
       thumb.appendChild(canvas);
-    } catch (e) {
-      // ignore individual page render errors
-    }
+    } catch (_) {}
   }
   return tiles;
 }
 
-// ---------- Step 3a: converter ----------
+// ============================================================
+// Converter
+// ============================================================
 async function openConverter() {
   convName.textContent = currentFile.name;
   convPages.textContent = `${pageCount} page${pageCount === 1 ? "" : "s"}`;
   convSelected.clear();
-  // default: select all
   for (let i = 1; i <= pageCount; i++) convSelected.add(i);
-  convQuick.value = "";
+  convFrom.value = 1; convFrom.max = pageCount;
+  convTo.value = pageCount; convTo.max = pageCount;
   showOnly(converterEl);
   updateConvSummary();
 
-  const tiles = await renderThumbnails(currentFile, convThumbs,
+  await renderThumbnails(currentFile, convThumbs,
     (i, tile) => {
       if (convSelected.has(i)) { convSelected.delete(i); tile.classList.remove("selected"); }
       else { convSelected.add(i); tile.classList.add("selected"); }
+      tile.style.setProperty("--tile-color", SECTION_COLORS[0]);
       updateConvSummary();
     },
     (allTiles) => {
-      // initial decoration: mark all as selected (gold)
       allTiles.forEach(t => {
         t.classList.add("selected");
-        t.style.setProperty("--tile-color", CHUNK_COLORS[0]);
+        t.style.setProperty("--tile-color", SECTION_COLORS[0]);
       });
     },
   );
-  // ensure tile color is set even if decorate ran before tiles were appended
-  tiles.forEach(t => t.style.setProperty("--tile-color", CHUNK_COLORS[0]));
 }
 
 function updateConvSummary() {
@@ -338,38 +310,37 @@ document.querySelectorAll("[data-conv-act]").forEach(btn => {
         if (convSelected.has(i)) convSelected.delete(i);
         else convSelected.add(i);
       }
-    } else if (act === "apply-quick") {
-      const set = parsePageSpec(convQuick.value.trim());
-      if (!set) {
-        showError(`Invalid page list. Try something like 1-3, 5, 8-10. Pages must be 1–${pageCount}.`);
+    } else if (act === "apply-range") {
+      const a = parseInt(convFrom.value, 10);
+      const b = parseInt(convTo.value, 10);
+      if (!a || !b || a < 1 || b < 1 || a > b || b > pageCount) {
+        showError(`Range must be between 1 and ${pageCount}, with From ≤ To.`);
         return;
       }
       convSelected.clear();
-      set.forEach(p => convSelected.add(p));
+      for (let i = a; i <= b; i++) convSelected.add(i);
     }
     syncConvTiles();
     updateConvSummary();
   });
 });
-convQuick.addEventListener("keydown", e => {
-  if (e.key === "Enter") {
-    e.preventDefault();
-    document.querySelector('[data-conv-act="apply-quick"]').click();
-  }
-});
 
 function syncConvTiles() {
   Array.from(convThumbs.children).forEach(tile => {
     const i = parseInt(tile.dataset.page, 10);
-    if (convSelected.has(i)) tile.classList.add("selected");
-    else tile.classList.remove("selected");
+    if (convSelected.has(i)) {
+      tile.classList.add("selected");
+      tile.style.setProperty("--tile-color", SECTION_COLORS[0]);
+    } else {
+      tile.classList.remove("selected");
+    }
   });
 }
 
 convBack.addEventListener("click", showChooser);
 convertBtn.addEventListener("click", () => {
   if (convSelected.size === 0) {
-    showError("The Boss needs at least one page, kid.");
+    showError("The boss needs at least one page, kid.");
     return;
   }
   const spec = convSelected.size === pageCount ? "all" : compressPages(convSelected);
@@ -381,7 +352,7 @@ function runConvert(file, pageSpec) {
   fileSizeEl.textContent = fmtSize(file.size);
   progressBar.style.width = "0%";
   progressBar.classList.remove("indeterminate");
-  statusMsg.textContent = "Uploading to The Boss…";
+  statusMsg.textContent = "Filing it with the boss…";
   showOnly(statusEl);
 
   const form = new FormData();
@@ -399,7 +370,7 @@ function runConvert(file, pageSpec) {
     }
   };
   xhr.upload.onload = () => {
-    statusMsg.textContent = "Crunching tables. The Boss is on it…";
+    statusMsg.textContent = "The boss is crunching the numbers…";
     progressBar.classList.add("indeterminate");
   };
   xhr.onload = () => {
@@ -412,8 +383,8 @@ function runConvert(file, pageSpec) {
       downloadLink.href = url;
       downloadLink.download = outName;
       resultMsg.textContent = pageSpec === "all"
-        ? "Whole document converted. Boss is pleased."
-        : `Converted pages: ${pageSpec}. Boss is pleased.`;
+        ? "Whole document converted."
+        : `Converted pages: ${pageSpec}.`;
       showOnly(resultEl);
       downloadLink.click();
     } else {
@@ -431,152 +402,167 @@ function runConvert(file, pageSpec) {
   xhr.send(form);
 }
 
-// ---------- Step 3b: splitter ----------
+// ============================================================
+// Splitter — section rows with from/to range inputs
+// ============================================================
+
 async function openSplitter() {
   splitName.textContent = currentFile.name;
   splitPages.textContent = `${pageCount} page${pageCount === 1 ? "" : "s"}`;
-  // sensible default: one chunk covering the first half (or all if 1 page)
-  chunks = [];
-  if (pageCount === 1) {
-    chunks.push(makeChunk(0, [1]));
-  } else {
-    const mid = Math.ceil(pageCount / 2);
-    chunks.push(makeChunk(0, range(1, mid)));
-    chunks.push(makeChunk(1, range(mid + 1, pageCount)));
-  }
-  activeChunkIdx = chunks.length - 1; // last one usually the empty/edited one
+  // default: ONE section, page 1 → last page
+  sections = [{ from: 1, to: pageCount, color: SECTION_COLORS[0] }];
   showOnly(splitterEl);
-  renderChunkBar();
+  renderSections();
   updateSplitSummary();
 
-  await renderThumbnails(currentFile, splitThumbs,
-    (i, tile) => onSplitTileClick(i, tile),
-    (allTiles) => allTiles.forEach(decorateSplitTile),
-  );
+  await renderThumbnails(currentFile, splitThumbs, null, (allTiles) => {
+    allTiles.forEach(decorateSplitTile);
+  });
 }
 
-function makeChunk(idx, pages) {
-  return {
-    color: CHUNK_COLORS[idx % CHUNK_COLORS.length],
-    pages: new Set(pages),
-  };
-}
-function range(a, b) {
-  const out = [];
-  for (let i = a; i <= b; i++) out.push(i);
-  return out;
+function renderSections() {
+  // refresh colors so they always cycle in row order
+  sections.forEach((s, i) => { s.color = SECTION_COLORS[i % SECTION_COLORS.length]; });
+
+  sectionListEl.innerHTML = "";
+  sections.forEach((s, idx) => {
+    const row = document.createElement("div");
+    row.className = "section-row";
+    row.style.setProperty("--sec-color", s.color);
+    const pages = Math.max(0, s.to - s.from + 1);
+    const valid = s.from >= 1 && s.to >= s.from && s.to <= pageCount;
+    row.innerHTML = `
+      <div class="section-marker">
+        <span class="section-dot"></span>
+        <span class="section-name">PDF #${idx + 1}</span>
+      </div>
+      <div class="section-range">
+        <span class="field-label">From page</span>
+        <input type="number" class="from" min="1" max="${pageCount}" value="${s.from}">
+        <span class="range-arrow">→</span>
+        <span class="field-label">to</span>
+        <input type="number" class="to" min="1" max="${pageCount}" value="${s.to}">
+      </div>
+      <span class="section-count ${valid ? '' : 'bad'}">
+        ${valid ? `${pages} page${pages === 1 ? "" : "s"}` : "invalid"}
+      </span>
+      <button class="section-remove" type="button" title="Remove" ${sections.length === 1 ? "disabled" : ""}>×</button>
+    `;
+    const fromInput = row.querySelector(".from");
+    const toInput = row.querySelector(".to");
+    fromInput.addEventListener("input", () => {
+      const v = parseInt(fromInput.value, 10);
+      if (!isNaN(v)) sections[idx].from = v;
+      onSectionsChanged();
+    });
+    toInput.addEventListener("input", () => {
+      const v = parseInt(toInput.value, 10);
+      if (!isNaN(v)) sections[idx].to = v;
+      onSectionsChanged();
+    });
+    row.querySelector(".section-remove").addEventListener("click", () => {
+      if (sections.length === 1) return;
+      sections.splice(idx, 1);
+      renderSections();
+      onSectionsChanged();
+    });
+    sectionListEl.appendChild(row);
+  });
 }
 
-function onSplitTileClick(i, tile) {
-  if (!chunks.length) return;
-  // remove from any chunk that owns it
-  const owner = chunks.findIndex(c => c.pages.has(i));
-  if (owner === activeChunkIdx) {
-    // clicking page already in active chunk: remove
-    chunks[owner].pages.delete(i);
-  } else {
-    if (owner !== -1) chunks[owner].pages.delete(i);
-    chunks[activeChunkIdx].pages.add(i);
-  }
-  decorateSplitTile(tile);
-  // also need to redecorate any sibling that lost ownership
+function onSectionsChanged() {
+  // Update count badge text + thumbs, but DON'T re-render section list (that would
+  // steal focus from the input the user is typing in).
+  Array.from(sectionListEl.children).forEach((row, idx) => {
+    const s = sections[idx];
+    if (!s) return;
+    const pages = Math.max(0, s.to - s.from + 1);
+    const valid = s.from >= 1 && s.to >= s.from && s.to <= pageCount;
+    const badge = row.querySelector(".section-count");
+    if (badge) {
+      badge.textContent = valid ? `${pages} page${pages === 1 ? "" : "s"}` : "invalid";
+      badge.classList.toggle("bad", !valid);
+    }
+  });
   syncSplitTiles();
-  renderChunkBar();
   updateSplitSummary();
 }
 
 function decorateSplitTile(tile) {
   const i = parseInt(tile.dataset.page, 10);
-  const owner = chunks.findIndex(c => c.pages.has(i));
+  // first section that contains the page wins for color/tag
+  let owner = -1;
+  for (let s = 0; s < sections.length; s++) {
+    const sec = sections[s];
+    if (sec.from <= i && i <= sec.to) { owner = s; break; }
+  }
+  let tag = tile.querySelector(".section-tag");
   if (owner === -1) {
     tile.classList.remove("selected");
     tile.style.removeProperty("--tile-color");
-    const tag = tile.querySelector(".chunk-tag");
     if (tag) tag.remove();
   } else {
+    const color = sections[owner].color;
     tile.classList.add("selected");
-    tile.style.setProperty("--tile-color", chunks[owner].color);
-    let tag = tile.querySelector(".chunk-tag");
+    tile.style.setProperty("--tile-color", color);
     if (!tag) {
       tag = document.createElement("div");
-      tag.className = "chunk-tag";
+      tag.className = "section-tag";
       tile.appendChild(tag);
     }
     tag.textContent = `#${owner + 1}`;
-    tag.style.background = chunks[owner].color;
+    tag.style.background = color;
   }
 }
 function syncSplitTiles() {
-  Array.from(splitThumbs.children).forEach(decorateSplitTile);
-}
-
-function renderChunkBar() {
-  chunkBar.innerHTML = "";
-  chunks.forEach((c, idx) => {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "chunk-chip" + (idx === activeChunkIdx ? " active" : "");
-    chip.style.setProperty("--chip-color", c.color);
-    const pagesText = c.pages.size === 0 ? "empty" : compressPages(c.pages);
-    chip.innerHTML = `
-      <span class="swatch"></span>
-      <span class="chip-name">Chunk ${idx + 1}</span>
-      <span class="count">${pagesText}</span>
-      <span class="x" title="Remove chunk">✕</span>
-    `;
-    chip.addEventListener("click", e => {
-      if (e.target.classList.contains("x")) {
-        e.stopPropagation();
-        if (chunks.length === 1) return; // keep at least one
-        chunks.splice(idx, 1);
-        // refresh colors so they stay in sequence
-        chunks.forEach((cc, j) => { cc.color = CHUNK_COLORS[j % CHUNK_COLORS.length]; });
-        if (activeChunkIdx >= chunks.length) activeChunkIdx = chunks.length - 1;
-        renderChunkBar();
-        syncSplitTiles();
-        updateSplitSummary();
-        return;
-      }
-      activeChunkIdx = idx;
-      renderChunkBar();
-    });
-    chunkBar.appendChild(chip);
+  Array.from(splitThumbs.children).forEach(tile => {
+    if (tile.classList.contains("page-tile")) decorateSplitTile(tile);
   });
 }
 
 function updateSplitSummary() {
-  const totalAssigned = chunks.reduce((s, c) => s + c.pages.size, 0);
-  const nonEmpty = chunks.filter(c => c.pages.size > 0).length;
-  splitSummary.textContent = `${nonEmpty} chunk${nonEmpty === 1 ? "" : "s"} · ${totalAssigned} of ${pageCount} pages assigned`;
+  const valid = sections.filter(s =>
+    s.from >= 1 && s.to >= s.from && s.to <= pageCount
+  );
+  const totalPages = valid.reduce((sum, s) => sum + (s.to - s.from + 1), 0);
+  const word = valid.length === 1 ? "PDF" : "PDFs";
+  splitSummary.textContent = `${valid.length} ${word} · ${totalPages} of ${pageCount} pages covered`;
 }
 
-addChunkBtn.addEventListener("click", () => {
-  chunks.push(makeChunk(chunks.length, []));
-  activeChunkIdx = chunks.length - 1;
-  renderChunkBar();
-  updateSplitSummary();
+addSectionBtn.addEventListener("click", () => {
+  // Heuristic for the next default range: pick up where the last one ends
+  const last = sections[sections.length - 1];
+  let from = 1, to = pageCount;
+  if (last && last.to < pageCount) {
+    from = last.to + 1;
+    to = pageCount;
+  }
+  sections.push({ from, to, color: SECTION_COLORS[sections.length % SECTION_COLORS.length] });
+  renderSections();
+  onSectionsChanged();
 });
 
 autoSplitBtn.addEventListener("click", () => {
-  chunks = [];
+  sections = [];
   for (let i = 1; i <= pageCount; i++) {
-    chunks.push(makeChunk(i - 1, [i]));
+    sections.push({ from: i, to: i, color: SECTION_COLORS[(i - 1) % SECTION_COLORS.length] });
   }
-  activeChunkIdx = 0;
-  renderChunkBar();
-  syncSplitTiles();
-  updateSplitSummary();
+  renderSections();
+  onSectionsChanged();
 });
 
 splitBack.addEventListener("click", showChooser);
 
 splitBtn.addEventListener("click", () => {
-  const real = chunks.filter(c => c.pages.size > 0);
-  if (!real.length) {
-    showError("No pages assigned to any chunk. Drop a few in.");
-    return;
+  // validate
+  for (let i = 0; i < sections.length; i++) {
+    const s = sections[i];
+    if (!(s.from >= 1 && s.to >= s.from && s.to <= pageCount)) {
+      showError(`PDF #${i + 1} has an invalid range. Use values between 1 and ${pageCount}.`);
+      return;
+    }
   }
-  const specs = real.map(c => compressPages(c.pages));
+  const specs = sections.map(s => s.from === s.to ? `${s.from}` : `${s.from}-${s.to}`);
   runSplit(currentFile, specs);
 });
 
@@ -585,7 +571,7 @@ function runSplit(file, specs) {
   fileSizeEl.textContent = fmtSize(file.size);
   progressBar.style.width = "0%";
   progressBar.classList.add("indeterminate");
-  statusMsg.textContent = "Carving up the document…";
+  statusMsg.textContent = "The boss is slicing it up…";
   showOnly(statusEl);
 
   Promise.all(specs.map(spec => splitOne(file, spec)))
@@ -631,17 +617,16 @@ function renderSplitResults(originalFile, results) {
   splitListEl.innerHTML = "";
   results.forEach((r, i) => {
     const url = URL.createObjectURL(r.blob);
-    const color = CHUNK_COLORS[i % CHUNK_COLORS.length];
+    const color = SECTION_COLORS[i % SECTION_COLORS.length];
     const item = document.createElement("div");
     item.className = "split-item";
     item.style.setProperty("--tile-color", color);
     item.innerHTML = `
-      <span class="chunk-dot" style="background:${color}"></span>
-      <div class="label">Chunk #${i + 1}</div>
+      <div class="label">PDF #${i + 1}</div>
       <div class="pages">pages ${r.spec}</div>
       <div class="actions">
         <a class="dl" href="${url}" download="${r.name}">⬇ PDF</a>
-        <button class="toxlsx" type="button">📊 Excel-ify</button>
+        <button class="toxlsx" type="button">📊 Make it Excel</button>
       </div>
     `;
     item.querySelector(".toxlsx").addEventListener("click", () => {
@@ -658,7 +643,7 @@ function renderSplitResults(originalFile, results) {
 async function reuploadAndConvert(file) {
   fileNameEl.textContent = file.name;
   fileSizeEl.textContent = fmtSize(file.size);
-  statusMsg.textContent = "Promoting chunk to the Excel department…";
+  statusMsg.textContent = "Promoting this slice to the Excel department…";
   progressBar.style.width = "0%";
   progressBar.classList.add("indeterminate");
   showOnly(statusEl);
@@ -668,7 +653,7 @@ async function reuploadAndConvert(file) {
     const res = await fetch("/api/pdf-info", { method: "POST", body: form });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      throw new Error(j.detail || "Could not read split PDF.");
+      throw new Error(j.detail || "Could not read PDF.");
     }
     const info = await res.json();
     pageCount = info.pages || 1;

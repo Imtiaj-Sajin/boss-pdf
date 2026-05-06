@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>boss-pdf — The Boss of all PDFs</title>
+  <title>boss-pdf — drop it on the boss's desk</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Fraunces:ital,wght@0,600;0,700;0,800;1,600;1,700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=5" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;0,9..144,800;1,9..144,600;1,9..144,700;1,9..144,800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css?v=6" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
           crossorigin="anonymous"
           referrerpolicy="no-referrer"></script>
@@ -15,28 +15,37 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <div class="logo" aria-hidden="true">B</div>
+      <div class="logo" aria-hidden="true">
+        <span class="logo-crown"></span>
+        <span class="logo-letter">B</span>
+      </div>
       <div class="brand-text">
         <span class="title">boss<span class="dot">·</span>pdf</span>
-        <span class="subtitle">The boss of all PDFs.</span>
+        <span class="subtitle">
+          <span class="status-dot"></span>
+          The boss is in.
+        </span>
       </div>
     </div>
     <div class="header-right">
-      <span class="header-tag">Runs locally · files stay on your machine</span>
-      <span class="badge">Put that coffee down</span>
+      <span class="header-tag">Files stay on your machine, kid.</span>
     </div>
   </header>
 
   <main>
     <!-- STEP 1: upload -->
     <section id="dropzone" class="dropzone" aria-label="Upload PDF">
+      <div class="dz-stamp">CONFIDENTIAL</div>
       <div class="dz-inner">
-        <div class="hero-icon" aria-hidden="true">
-          <span>📄</span>
-        </div>
-        <h1>Drop a PDF on the desk.</h1>
+        <p class="kicker">— A memo from the boss —</p>
+        <h1>
+          Drop it on the
+          <em>boss's desk.</em>
+        </h1>
         <p class="sub">
-          or <button id="pickBtn" class="link-btn" type="button">choose a file</button>
+          PDFs in. Spreadsheets out.
+          <br>
+          Or <button id="pickBtn" class="link-btn" type="button">choose a file</button>
           &nbsp;·&nbsp; up to 50&nbsp;MB
         </p>
         <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden />
@@ -46,23 +55,23 @@
     <!-- STEP 2: choose tool -->
     <section id="chooser" class="card hidden">
       <div class="filebar">
-        <span class="memo">File received</span>
+        <span class="memo">Memo received</span>
         <span id="chooserName" class="fname"></span>
         <span id="chooserPages" class="fsize"></span>
       </div>
-      <h2 class="boss-line">What's the play?</h2>
-      <p class="boss-sub">Pick a tool. The Boss is busy.</p>
+      <h2 class="boss-line">What's the assignment?</h2>
+      <p class="boss-sub">Pick a department. The boss is on a tight schedule.</p>
 
       <div class="tools">
         <button class="tool-card" data-tool="convert" type="button">
           <div class="tool-emoji">📊</div>
-          <div class="tool-title">Excel-ify it</div>
-          <div class="tool-desc">Turn the PDF into a clean spreadsheet — full doc or just the pages you pick.</div>
+          <div class="tool-title">Make it Excel</div>
+          <div class="tool-desc">Turn this PDF into a clean spreadsheet — full document or just the pages you pick.</div>
         </button>
         <button class="tool-card" data-tool="split" type="button">
           <div class="tool-emoji">✂️</div>
-          <div class="tool-title">Split it up</div>
-          <div class="tool-desc">Carve the PDF into chunks. Download as PDFs, or promote one to Excel.</div>
+          <div class="tool-title">Slice it up</div>
+          <div class="tool-desc">Split the PDF into separate files by page range. Download each one or send to Excel.</div>
         </button>
       </div>
 
@@ -78,22 +87,25 @@
         <span id="convName" class="fname"></span>
         <span id="convPages" class="fsize"></span>
       </div>
-      <h2 class="boss-line">Tap the pages you want.</h2>
-      <p class="boss-sub"><span id="convSummary">No pages selected.</span></p>
+      <h2 class="boss-line">Pick the pages, kid.</h2>
+      <p class="boss-sub"><span id="convSummary">All pages selected.</span></p>
 
       <div class="page-toolbar">
-        <button class="ghost small" data-conv-act="all" type="button">Select all</button>
+        <button class="ghost small" data-conv-act="all" type="button">All pages</button>
         <button class="ghost small" data-conv-act="none" type="button">Clear</button>
         <button class="ghost small" data-conv-act="invert" type="button">Invert</button>
         <span class="toolbar-divider"></span>
-        <input type="text" id="convQuick" class="quick-input" placeholder="or type: 1-3, 5, 8-10" />
-        <button class="ghost small" data-conv-act="apply-quick" type="button">Apply</button>
+        <span class="toolbar-label">Range</span>
+        <input type="number" id="convFrom" class="range-mini" min="1" value="1" />
+        <span class="range-arrow">→</span>
+        <input type="number" id="convTo" class="range-mini" min="1" value="1" />
+        <button class="ghost small" data-conv-act="apply-range" type="button">Apply</button>
       </div>
 
       <div id="convThumbs" class="thumbgrid" aria-label="Pages"></div>
 
       <div class="row-actions">
-        <button id="convertBtn" class="primary" type="button">Make it Excel →</button>
+        <button id="convertBtn" class="primary" type="button">Make it Excel</button>
         <button id="convBack" class="ghost" type="button">← Back</button>
       </div>
     </section>
@@ -101,25 +113,32 @@
     <!-- STEP 3b: splitter -->
     <section id="splitter" class="card hidden">
       <div class="filebar">
-        <span class="memo">Split department</span>
+        <span class="memo">Splitting department</span>
         <span id="splitName" class="fname"></span>
         <span id="splitPages" class="fsize"></span>
       </div>
-      <h2 class="boss-line">Carve it up.</h2>
-      <p class="boss-sub">Pick an active chunk, then tap pages to drop them in. Each chunk becomes its own PDF.</p>
+      <h2 class="boss-line">How should I slice it?</h2>
+      <p class="boss-sub">Set the page range for each new PDF. Add more rows for more files.</p>
 
-      <div id="chunkBar" class="chunkbar"></div>
+      <div id="sectionList" class="section-list"></div>
+
       <div class="page-toolbar">
-        <button id="addChunkBtn" class="ghost small" type="button">+ New chunk</button>
-        <button id="autoSplitBtn" class="ghost small" type="button" title="Each page becomes its own chunk">⚡ One per page</button>
+        <button id="addSectionBtn" class="ghost small" type="button">+ Add another PDF</button>
+        <button id="autoSplitBtn" class="ghost small" type="button" title="Each page becomes its own PDF">⚡ One PDF per page</button>
         <span class="toolbar-divider"></span>
         <span id="splitSummary" class="hint" style="margin:0;"></span>
       </div>
 
-      <div id="splitThumbs" class="thumbgrid" aria-label="Pages"></div>
+      <div class="preview-block">
+        <div class="preview-header">
+          <span class="preview-label">Preview</span>
+          <span class="preview-hint">colored rings show which PDF each page goes into</span>
+        </div>
+        <div id="splitThumbs" class="thumbgrid" aria-label="Pages"></div>
+      </div>
 
       <div class="row-actions">
-        <button id="splitBtn" class="primary" type="button">Split &amp; download →</button>
+        <button id="splitBtn" class="primary" type="button">Slice it up</button>
         <button id="splitBack" class="ghost" type="button">← Back</button>
       </div>
     </section>
@@ -131,12 +150,12 @@
         <span id="fileSize" class="fsize"></span>
       </div>
       <div class="progress"><div id="progressBar" class="bar"></div></div>
-      <p id="statusMsg" class="msg">The Boss is reviewing your file…</p>
+      <p id="statusMsg" class="msg">The boss is reviewing your file…</p>
     </section>
 
     <!-- DONE: convert -->
     <section id="result" class="card hidden">
-      <div class="ok">Done. The Boss approves.</div>
+      <div class="ok">The boss approves.</div>
       <p class="boss-sub" id="resultMsg">Your spreadsheet is ready, kid.</p>
       <div class="row-actions">
         <a id="downloadLink" class="primary" download>Download .xlsx</a>
@@ -146,8 +165,8 @@
 
     <!-- DONE: split -->
     <section id="splitResult" class="card hidden">
-      <div class="ok">Carved up. Boss approves.</div>
-      <p class="boss-sub">Download a chunk, or promote one straight to Excel.</p>
+      <div class="ok">Sliced clean. The boss approves.</div>
+      <p class="boss-sub">Download each PDF, or promote one straight to Excel.</p>
       <div id="splitList" class="splitlist"></div>
       <div class="row-actions">
         <button id="splitAgainBtn" class="ghost" type="button">Boss another file</button>
@@ -156,16 +175,16 @@
 
     <!-- ERROR -->
     <section id="error" class="card hidden">
-      <div class="bad">The Boss is not amused.</div>
+      <div class="bad">The boss is not amused.</div>
       <p id="errorMsg"></p>
       <button id="retryBtn" class="ghost" type="button">Try again</button>
     </section>
   </main>
 
   <footer>
-    <small>Runs locally. Files never leave your machine.</small>
+    <small>boss-pdf · runs locally · files never leave your machine</small>
   </footer>
 
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
 </body>
 </html>
