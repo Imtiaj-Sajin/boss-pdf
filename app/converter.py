@@ -218,10 +218,12 @@ def _extract_page_title_lines(page, table_bboxes: list[tuple]) -> list[str]:
     return [ln for ln in lines if ln]
 
 
-def _extract_pdfplumber(pdf_path: str) -> list[PageResult]:
+def _extract_pdfplumber(pdf_path: str, pages: Optional[set[int]] = None) -> list[PageResult]:
     results: list[PageResult] = []
     with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
+            if pages is not None and i not in pages:
+                continue
             tables: list[RichTable] = []
             table_bboxes: list[tuple] = []
             for settings in _TABLE_SETTINGS_OPTIONS:
@@ -252,12 +254,19 @@ def _extract_pdfplumber(pdf_path: str) -> list[PageResult]:
 
 # ---------- Extraction: camelot (fallback, plain text) ----------
 
-def _camelot_pages(pdf_path: str, flavor: str, page_count: int) -> dict[int, list[RichTable]]:
+def _camelot_pages(pdf_path: str, flavor: str, page_count: int,
+                   pages: Optional[set[int]] = None) -> dict[int, list[RichTable]]:
     out: dict[int, list[RichTable]] = {}
     if not _HAS_CAMELOT:
         return out
+    if pages is not None:
+        if not pages:
+            return out
+        page_spec = ",".join(str(p) for p in sorted(pages))
+    else:
+        page_spec = f"1-{page_count}"
     try:
-        tlist = camelot.read_pdf(pdf_path, pages=f"1-{page_count}",
+        tlist = camelot.read_pdf(pdf_path, pages=page_spec,
                                  flavor=flavor, suppress_stdout=True)
     except Exception as e:
         logger.warning("camelot %s failed: %s", flavor, e)
@@ -302,11 +311,14 @@ def _extract_ocr_page(pdf_path: str, page_num: int) -> Optional[RichTable]:
 
 # ---------- Pipeline ----------
 
-def convert_pdf_to_workbook(pdf_path: str) -> Workbook:
-    pp_results = _extract_pdfplumber(pdf_path)
-    page_count = len(pp_results)
-    lattice = _camelot_pages(pdf_path, "lattice", page_count)
-    stream = _camelot_pages(pdf_path, "stream", page_count)
+def convert_pdf_to_workbook(pdf_path: str, pages: Optional[set[int]] = None) -> Workbook:
+    pp_results = _extract_pdfplumber(pdf_path, pages=pages)
+    if pages is not None:
+        page_count = max(pages) if pages else 0
+    else:
+        page_count = len(pp_results)
+    lattice = _camelot_pages(pdf_path, "lattice", page_count, pages=pages)
+    stream = _camelot_pages(pdf_path, "stream", page_count, pages=pages)
 
     pp_total_tables = sum(len(r.tables) for r in pp_results)
     cm_total = sum(len(v) for v in lattice.values()) + sum(len(v) for v in stream.values())
@@ -538,12 +550,13 @@ def _build_workbook(pages: list[PageResult]) -> Workbook:
     return wb
 
 
-def convert_pdf_bytes_to_xlsx_bytes(pdf_bytes: bytes) -> bytes:
+def convert_pdf_bytes_to_xlsx_bytes(pdf_bytes: bytes,
+                                    pages: Optional[set[int]] = None) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
         f.write(pdf_bytes)
         tmp_path = f.name
     try:
-        wb = convert_pdf_to_workbook(tmp_path)
+        wb = convert_pdf_to_workbook(tmp_path, pages=pages)
         buf = io.BytesIO()
         wb.save(buf)
         return buf.getvalue()
@@ -552,3 +565,53 @@ def convert_pdf_bytes_to_xlsx_bytes(pdf_bytes: bytes) -> bytes:
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+# ---------- Page-range parsing ----------
+
+def parse_page_spec(spec: str, total_pages: int) -> set[int]:
+    """Parse '1-3,5,7-9' into {1,2,3,5,7,8,9}, clamped to [1, total_pages].
+
+    Accepts 'all' (case-insensitive) or empty as 'every page'.
+    Raises ValueError on malformed input or out-of-range pages.
+    """
+    if total_pages <= 0:
+        raise ValueError("PDF has no pages.")
+    if spec is None:
+        return set(range(1, total_pages + 1))
+    s = spec.strip().lower()
+    if not s or s == "all":
+        return set(range(1, total_pages + 1))
+
+    out: set[int] = set()
+    for chunk in s.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            a, _, b = chunk.partition("-")
+            try:
+                start = int(a.strip())
+                end = int(b.strip())
+            except ValueError as e:
+                raise ValueError(f"Invalid range '{chunk}'.") from e
+            if start < 1 or end < 1 or start > end:
+                raise ValueError(f"Invalid range '{chunk}'.")
+            if end > total_pages:
+                raise ValueError(
+                    f"Range {chunk} exceeds page count ({total_pages})."
+                )
+            out.update(range(start, end + 1))
+        else:
+            try:
+                p = int(chunk)
+            except ValueError as e:
+                raise ValueError(f"Invalid page '{chunk}'.") from e
+            if p < 1 or p > total_pages:
+                raise ValueError(
+                    f"Page {p} out of range (1–{total_pages})."
+                )
+            out.add(p)
+    if not out:
+        raise ValueError("No pages selected.")
+    return out

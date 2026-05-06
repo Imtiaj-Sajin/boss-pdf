@@ -1,16 +1,20 @@
-"""FastAPI backend for boss-pdf: PDF -> Excel converter."""
+"""FastAPI backend for boss-pdf: PDF -> Excel converter + splitter."""
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
+import zipfile
 from pathlib import Path
+from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pypdf import PdfReader, PdfWriter
 
-from .converter import convert_pdf_bytes_to_xlsx_bytes
+from .converter import convert_pdf_bytes_to_xlsx_bytes, parse_page_spec
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("boss-pdf")
@@ -18,9 +22,24 @@ log = logging.getLogger("boss-pdf")
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
 
-app = FastAPI(title="boss-pdf", description="PDF to Excel converter")
+app = FastAPI(title="boss-pdf", description="The Boss of all PDFs.")
 
 MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+def _validate_pdf(pdf_bytes: bytes) -> None:
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Empty file. The Boss expected something.")
+    if len(pdf_bytes) > MAX_BYTES:
+        raise HTTPException(status_code=413,
+                            detail=f"File exceeds {MAX_BYTES // (1024*1024)} MB. Trim it down, kid.")
+    if pdf_bytes[:5] != b"%PDF-":
+        raise HTTPException(status_code=400, detail="That's not a PDF. Don't try to fool The Boss.")
+
+
+def _safe_filename(name: str) -> str:
+    base = os.path.basename(name or "file")
+    return "".join(c for c in base if c.isalnum() or c in ("-", "_", ".", " ")).strip() or "file"
 
 
 @app.get("/api/health")
@@ -28,33 +47,144 @@ def health() -> dict:
     return {"ok": True}
 
 
+@app.post("/api/pdf-info")
+async def pdf_info(file: UploadFile = File(...)) -> dict:
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Please upload a .pdf file.")
+    pdf_bytes = await file.read()
+    _validate_pdf(pdf_bytes)
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        if reader.is_encrypted:
+            try:
+                reader.decrypt("")
+            except Exception:
+                raise HTTPException(status_code=400,
+                                    detail="PDF is password-protected. The Boss doesn't do passwords.")
+        pages = len(reader.pages)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("pdf-info failed")
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}") from e
+    return {"pages": pages, "filename": file.filename, "size": len(pdf_bytes)}
+
+
 @app.post("/api/convert")
-async def convert(file: UploadFile = File(...)):
+async def convert(file: UploadFile = File(...),
+                  pages: Optional[str] = Form(None)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a .pdf file.")
 
     pdf_bytes = await file.read()
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="Empty file.")
-    if len(pdf_bytes) > MAX_BYTES:
-        raise HTTPException(status_code=413, detail=f"File exceeds {MAX_BYTES // (1024*1024)} MB limit.")
-    if not pdf_bytes[:5] == b"%PDF-":
-        raise HTTPException(status_code=400, detail="Not a valid PDF (missing %PDF header).")
+    _validate_pdf(pdf_bytes)
 
-    log.info("converting %s (%d bytes)", file.filename, len(pdf_bytes))
+    # Determine page count for validation
     try:
-        xlsx_bytes = convert_pdf_bytes_to_xlsx_bytes(pdf_bytes)
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        total = len(reader.pages)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}") from e
+
+    page_set: Optional[set[int]] = None
+    if pages and pages.strip().lower() not in ("", "all"):
+        try:
+            page_set = parse_page_spec(pages, total)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    log.info("converting %s (%d bytes) pages=%s", file.filename, len(pdf_bytes), pages or "all")
+    try:
+        xlsx_bytes = convert_pdf_bytes_to_xlsx_bytes(pdf_bytes, pages=page_set)
     except Exception as e:
         log.exception("conversion failed")
         raise HTTPException(status_code=500, detail=f"Conversion failed: {e}") from e
 
-    out_name = os.path.splitext(os.path.basename(file.filename))[0] + ".xlsx"
+    stem = os.path.splitext(_safe_filename(file.filename))[0]
+    out_name = f"{stem}.xlsx"
     headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
     return StreamingResponse(
         io.BytesIO(xlsx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers=headers,
     )
+
+
+def _extract_pages_to_pdf(reader: PdfReader, page_indices: list[int]) -> bytes:
+    writer = PdfWriter()
+    for idx in page_indices:
+        writer.add_page(reader.pages[idx])
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+@app.post("/api/split")
+async def split(file: UploadFile = File(...),
+                ranges: str = Form(...)):
+    """Split a PDF into one or more output PDFs.
+
+    `ranges` is a JSON array of strings, each a page-spec like "1-3" or "5".
+    Returns a single PDF if one range, otherwise a ZIP of named PDFs.
+    """
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Please upload a .pdf file.")
+
+    pdf_bytes = await file.read()
+    _validate_pdf(pdf_bytes)
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        if reader.is_encrypted:
+            try:
+                reader.decrypt("")
+            except Exception:
+                raise HTTPException(status_code=400,
+                                    detail="PDF is password-protected.")
+        total = len(reader.pages)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}") from e
+
+    try:
+        spec_list = json.loads(ranges)
+        if not isinstance(spec_list, list) or not spec_list:
+            raise ValueError("ranges must be a non-empty list")
+        spec_list = [str(s) for s in spec_list]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid ranges: {e}") from e
+
+    parsed: list[tuple[str, list[int]]] = []
+    for spec in spec_list:
+        try:
+            pages = parse_page_spec(spec, total)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        # 0-indexed for pypdf, sorted
+        idx = sorted(p - 1 for p in pages)
+        parsed.append((spec, idx))
+
+    stem = os.path.splitext(_safe_filename(file.filename))[0]
+
+    if len(parsed) == 1:
+        spec, idx = parsed[0]
+        out = _extract_pages_to_pdf(reader, idx)
+        out_name = f"{stem}_p{spec.replace(',', '_')}.pdf"
+        headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+        return StreamingResponse(io.BytesIO(out), media_type="application/pdf", headers=headers)
+
+    # Multiple ranges -> zip them up
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, (spec, idx) in enumerate(parsed, start=1):
+            part = _extract_pages_to_pdf(reader, idx)
+            label = spec.replace(",", "_")
+            zf.writestr(f"{stem}_part{i}_p{label}.pdf", part)
+    zip_buf.seek(0)
+    out_name = f"{stem}_split.zip"
+    headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+    return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
 
 
 # Serve the static frontend at /

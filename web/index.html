@@ -3,52 +3,171 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>boss-pdf — PDF to Excel</title>
+  <title>boss-pdf — The Boss of all PDFs</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <span class="logo">📄→📊</span>
-      <span class="title">boss-pdf</span>
+      <span class="logo" aria-hidden="true">
+        <span class="baby">👶</span><span class="tie">👔</span>
+      </span>
+      <div class="brand-text">
+        <span class="title">boss-pdf</span>
+        <span class="subtitle">The Boss of all PDFs.</span>
+      </div>
     </div>
-    <div class="tag">PDF → Excel, the way you'd actually want it.</div>
+    <div class="badge">PUT THAT COFFEE DOWN.</div>
   </header>
 
   <main>
+    <!-- STEP 1: upload -->
     <section id="dropzone" class="dropzone" aria-label="Upload PDF">
       <div class="dz-inner">
-        <div class="dz-icon">⬆</div>
-        <h1>Drop a PDF here</h1>
-        <p>or <button id="pickBtn" class="link-btn" type="button">choose a file</button> — up to 50 MB</p>
+        <div class="briefcase" aria-hidden="true">💼</div>
+        <h1>Drop the PDF on The Boss's desk.</h1>
+        <p class="sub">
+          or <button id="pickBtn" class="link-btn" type="button">choose a file</button>
+          — and make it snappy. Up to 50 MB.
+        </p>
+        <p class="quip">"Cookies are a sometimes snack. PDFs are an all-the-time snack."</p>
         <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden />
       </div>
     </section>
 
-    <section id="status" class="status hidden">
+    <!-- STEP 2: choose tool -->
+    <section id="chooser" class="card hidden">
+      <div class="filebar">
+        <span class="memo">📎 MEMO RECEIVED</span>
+        <span id="chooserName" class="fname"></span>
+        <span id="chooserPages" class="fsize"></span>
+      </div>
+      <h2 class="boss-line">Alright, let's talk business.</h2>
+      <p class="boss-sub">What does The Boss want done with this file?</p>
+
+      <div class="tools">
+        <button class="tool-card" data-tool="convert" type="button">
+          <div class="tool-emoji">📊</div>
+          <div class="tool-title">Excel-ify it</div>
+          <div class="tool-desc">Turn this PDF into a clean spreadsheet. Full doc or pick the pages you want.</div>
+        </button>
+        <button class="tool-card" data-tool="split" type="button">
+          <div class="tool-emoji">✂️</div>
+          <div class="tool-title">Split it up</div>
+          <div class="tool-desc">Carve the PDF into pieces. Download them, or send a piece to Excel-ify.</div>
+        </button>
+      </div>
+
+      <div class="row-actions">
+        <button id="changeFileBtn" class="ghost" type="button">← Different file</button>
+      </div>
+    </section>
+
+    <!-- STEP 3a: converter -->
+    <section id="converter" class="card hidden">
+      <div class="filebar">
+        <span class="memo">📊 EXCEL DEPARTMENT</span>
+        <span id="convName" class="fname"></span>
+        <span id="convPages" class="fsize"></span>
+      </div>
+      <h2 class="boss-line">Which pages, exactly?</h2>
+      <p class="boss-sub">The Boss does not waste billable hours. Pick wisely.</p>
+
+      <div class="modepicker" role="radiogroup" aria-label="Page selection">
+        <label class="mode">
+          <input type="radio" name="convMode" value="all" checked />
+          <span><strong>The whole shebang</strong><small>convert every page</small></span>
+        </label>
+        <label class="mode">
+          <input type="radio" name="convMode" value="range" />
+          <span><strong>A range</strong><small>e.g. pages 2 through 7</small></span>
+        </label>
+        <label class="mode">
+          <input type="radio" name="convMode" value="custom" />
+          <span><strong>Hand-picked</strong><small>list / mix, e.g. 1-3,5,8</small></span>
+        </label>
+      </div>
+
+      <div id="convRangeBox" class="rangebox hidden">
+        <label>From <input type="number" id="convFrom" min="1" value="1" /></label>
+        <label>To <input type="number" id="convTo" min="1" value="1" /></label>
+      </div>
+
+      <div id="convCustomBox" class="rangebox hidden">
+        <label class="full">
+          Pages
+          <input type="text" id="convCustom" placeholder="e.g. 1-3, 5, 8-10" />
+        </label>
+        <p class="hint">Use commas for lists, hyphens for ranges. The Boss can read.</p>
+      </div>
+
+      <div class="row-actions">
+        <button id="convertBtn" class="primary" type="button">📊 Make it Excel</button>
+        <button id="convBack" class="ghost" type="button">← Back</button>
+      </div>
+    </section>
+
+    <!-- STEP 3b: splitter -->
+    <section id="splitter" class="card hidden">
+      <div class="filebar">
+        <span class="memo">✂️ SPLIT DEPARTMENT</span>
+        <span id="splitName" class="fname"></span>
+        <span id="splitPages" class="fsize"></span>
+      </div>
+      <h2 class="boss-line">Carve it up however you like.</h2>
+      <p class="boss-sub">Each chunk becomes its own PDF. The Boss likes options.</p>
+
+      <div id="splitRanges" class="ranges"></div>
+      <button id="addRangeBtn" class="ghost small" type="button">+ Add another chunk</button>
+
+      <div class="row-actions">
+        <button id="splitBtn" class="primary" type="button">✂️ Split &amp; download</button>
+        <button id="splitBack" class="ghost" type="button">← Back</button>
+      </div>
+
+      <p class="hint">
+        Got one chunk? You'll get a single PDF. Got many? A nice zipped briefcase of PDFs.
+      </p>
+    </section>
+
+    <!-- WORKING -->
+    <section id="status" class="card hidden">
       <div class="filebar">
         <span id="fileName" class="fname"></span>
         <span id="fileSize" class="fsize"></span>
       </div>
       <div class="progress"><div id="progressBar" class="bar"></div></div>
-      <p id="statusMsg" class="msg">Uploading…</p>
+      <p id="statusMsg" class="msg">The Boss is reviewing your file…</p>
     </section>
 
-    <section id="result" class="result hidden">
-      <div class="ok">✅ Done</div>
-      <a id="downloadLink" class="download" download>Download .xlsx</a>
-      <button id="againBtn" class="ghost" type="button">Convert another</button>
+    <!-- DONE: convert -->
+    <section id="result" class="card hidden">
+      <div class="ok">✅ The Boss approves.</div>
+      <p class="boss-sub" id="resultMsg">Your spreadsheet is ready, kid.</p>
+      <a id="downloadLink" class="primary" download>⬇ Download .xlsx</a>
+      <button id="againBtn" class="ghost" type="button">Boss another file</button>
     </section>
 
-    <section id="error" class="error hidden">
-      <div class="bad">⚠ Something went wrong</div>
+    <!-- DONE: split -->
+    <section id="splitResult" class="card hidden">
+      <div class="ok">✅ Carved up. Boss approves.</div>
+      <p class="boss-sub">Your chunks are ready. Download them, or promote one straight to Excel.</p>
+      <div id="splitList" class="splitlist"></div>
+      <div class="row-actions">
+        <button id="splitAgainBtn" class="ghost" type="button">Boss another file</button>
+      </div>
+    </section>
+
+    <!-- ERROR -->
+    <section id="error" class="card hidden">
+      <div class="bad">⚠ The Boss is not amused.</div>
       <p id="errorMsg"></p>
       <button id="retryBtn" class="ghost" type="button">Try again</button>
     </section>
   </main>
 
   <footer>
-    <small>Runs locally. Files never leave your machine.</small>
+    <small>Runs locally. The Boss values discretion — files never leave your machine.</small>
   </footer>
 
   <script src="/static/app.js"></script>
