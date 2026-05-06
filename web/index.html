@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>boss-pdf — PDF to Excel</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">📄→📊</span>
+      <span class="title">boss-pdf</span>
+    </div>
+    <div class="tag">PDF → Excel, the way you'd actually want it.</div>
+  </header>
+
+  <main>
+    <section id="dropzone" class="dropzone" aria-label="Upload PDF">
+      <div class="dz-inner">
+        <div class="dz-icon">⬆</div>
+        <h1>Drop a PDF here</h1>
+        <p>or <button id="pickBtn" class="link-btn" type="button">choose a file</button> — up to 50 MB</p>
+        <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden />
+      </div>
+    </section>
+
+    <section id="status" class="status hidden">
+      <div class="filebar">
+        <span id="fileName" class="fname"></span>
+        <span id="fileSize" class="fsize"></span>
+      </div>
+      <div class="progress"><div id="progressBar" class="bar"></div></div>
+      <p id="statusMsg" class="msg">Uploading…</p>
+    </section>
+
+    <section id="result" class="result hidden">
+      <div class="ok">✅ Done</div>
+      <a id="downloadLink" class="download" download>Download .xlsx</a>
+      <button id="againBtn" class="ghost" type="button">Convert another</button>
+    </section>
+
+    <section id="error" class="error hidden">
+      <div class="bad">⚠ Something went wrong</div>
+      <p id="errorMsg"></p>
+      <button id="retryBtn" class="ghost" type="button">Try again</button>
+    </section>
+  </main>
+
+  <footer>
+    <small>Runs locally. Files never leave your machine.</small>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

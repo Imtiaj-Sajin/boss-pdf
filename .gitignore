@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.xlsx
+*.tmp
+.DS_Store
+.idea/
+.vscode/
+.claude/
