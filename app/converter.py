@@ -1,9 +1,14 @@
 """PDF -> Excel conversion engine.
 
-Strategy: try several extraction methods per page, score each, pick the best.
-The pdfplumber path also reads char-level styling (bold, color) from the PDF
-so the output xlsx visually resembles the source. Falls back to OCR for
-scanned PDFs.
+Per-page best-of strategy:
+  1. pdfplumber           — native PDFs with a text layer (preserves styling)
+  2. Camelot (lattice)    — tables with visible borders
+  3. Camelot (stream)     — tables without borders
+  4. PaddleOCR PP-Structure — scanned pages, layout + table-aware OCR
+  5. Tesseract (smart)    — final fallback, with row/column clustering
+
+Pages are auto-detected as scanned (no text layer) and routed through OCR.
+Page rendering uses PyMuPDF, so Poppler is NOT required.
 """
 from __future__ import annotations
 
@@ -14,6 +19,7 @@ import re
 import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from typing import Iterable, Optional
 
 import pdfplumber
@@ -23,7 +29,8 @@ from openpyxl.utils import get_column_letter
 
 logger = logging.getLogger(__name__)
 
-# Optional deps — imported lazily so the app still works if a method is unavailable.
+# ---- Optional deps (imported lazily / behind capability flags) ----
+
 try:
     import camelot  # type: ignore
     _HAS_CAMELOT = True
@@ -31,14 +38,39 @@ except Exception as e:
     logger.warning("camelot unavailable: %s", e)
     _HAS_CAMELOT = False
 
+# PyMuPDF: page -> image rendering without Poppler.
+try:
+    import fitz  # PyMuPDF
+    from PIL import Image  # noqa: F401
+    _HAS_FITZ = True
+except Exception as e:
+    logger.warning("PyMuPDF unavailable: %s", e)
+    _HAS_FITZ = False
+
+# PaddleOCR PP-Structure: layout + table-aware OCR. Heavy first import.
+try:
+    import paddleocr  # noqa: F401
+    _HAS_PADDLE = True
+except Exception as e:
+    logger.info("paddleocr not available: %s", e)
+    _HAS_PADDLE = False
+
+_PADDLE_ENGINE = None  # cached PPStructure instance (or False if init failed)
+
+# Tesseract OCR (fallback only; needs system Tesseract binary).
 try:
     import pytesseract  # type: ignore
-    from pdf2image import convert_from_path  # type: ignore
-    from PIL import Image  # noqa: F401
-    _HAS_OCR = True
+    _HAS_TESSERACT = True
 except Exception as e:
-    logger.warning("OCR stack unavailable: %s", e)
-    _HAS_OCR = False
+    logger.info("tesseract OCR not available: %s", e)
+    _HAS_TESSERACT = False
+
+# pdf2image is a last-resort renderer (needs Poppler).
+try:
+    from pdf2image import convert_from_path  # type: ignore
+    _HAS_PDF2IMAGE = True
+except Exception:
+    _HAS_PDF2IMAGE = False
 
 
 # ---------- Rich data model ----------
@@ -66,6 +98,7 @@ class PageResult:
     title_lines: list[str]
     method: str
     score: float
+    char_count: int = 0  # number of native-text chars on the page; 0 → likely scanned
 
 
 # ---------- Char-level helpers (pdfplumber) ----------
@@ -245,9 +278,13 @@ def _extract_pdfplumber(pdf_path: str, pages: Optional[set[int]] = None) -> list
 
             title_lines = _extract_page_title_lines(page, table_bboxes)
             score = sum(_score_table(t) for t in tables)
+            try:
+                char_count = len(page.chars)
+            except Exception:
+                char_count = 0
             results.append(PageResult(
                 page_num=i, tables=tables, title_lines=title_lines,
-                method="pdfplumber", score=score,
+                method="pdfplumber", score=score, char_count=char_count,
             ))
     return results
 
@@ -283,30 +320,373 @@ def _camelot_pages(pdf_path: str, flavor: str, page_count: int,
     return out
 
 
-# ---------- Extraction: OCR (fallback for scanned PDFs) ----------
+# ---------- Page rendering (PyMuPDF first, Poppler last-resort) ----------
 
-def _extract_ocr_page(pdf_path: str, page_num: int) -> Optional[RichTable]:
-    if not _HAS_OCR:
+def _render_page_image(pdf_path: str, page_num: int, dpi: int = 300):
+    """Render a single PDF page to a PIL.Image. Prefers PyMuPDF (no Poppler)."""
+    if _HAS_FITZ:
+        try:
+            doc = fitz.open(pdf_path)
+            try:
+                page = doc[page_num - 1]
+                mat = fitz.Matrix(dpi / 72, dpi / 72)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                mode = "RGB" if pix.n in (3, 4) else "L"
+                img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                return img
+            finally:
+                doc.close()
+        except Exception as e:
+            logger.warning("PyMuPDF render p%d failed: %s", page_num, e)
+    if _HAS_PDF2IMAGE:
+        try:
+            imgs = convert_from_path(pdf_path, dpi=dpi,
+                                     first_page=page_num, last_page=page_num)
+            return imgs[0] if imgs else None
+        except Exception as e:
+            logger.warning("pdf2image render p%d failed: %s", page_num, e)
+    return None
+
+
+# ---------- HTML table parser (used for PP-Structure output) ----------
+
+class _HtmlTableParser(HTMLParser):
+    """Parse a single <table>...</table> string into a RichTable, honoring
+    <th> bold styling and basic colspan/rowspan."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._rows: list[list[Optional[RichCell]]] = []
+        self._row: Optional[list[Optional[RichCell]]] = None
+        self._cell_text: Optional[list[str]] = None
+        self._cell_is_th = False
+        self._cell_colspan = 1
+        self._cell_rowspan = 1
+        self._bold_depth = 0
+        # rowspan tracking: cells "owed" to upcoming rows by column index
+        self._rowspan_owed: list[int] = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "tr":
+            self._row = []
+            # apply any rowspans owed from earlier rows
+            for ci, owed in enumerate(self._rowspan_owed):
+                if owed > 0:
+                    while len(self._row) <= ci:
+                        self._row.append(None)
+                    self._row[ci] = RichCell()  # blank merged-cell placeholder
+        elif tag in ("td", "th"):
+            self._cell_text = []
+            self._cell_is_th = (tag == "th")
+            d = dict(attrs)
+            try:
+                self._cell_colspan = max(1, int(d.get("colspan", 1)))
+            except ValueError:
+                self._cell_colspan = 1
+            try:
+                self._cell_rowspan = max(1, int(d.get("rowspan", 1)))
+            except ValueError:
+                self._cell_rowspan = 1
+        elif tag in ("b", "strong"):
+            self._bold_depth += 1
+        elif tag == "br":
+            if self._cell_text is not None:
+                self._cell_text.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "tr" and self._row is not None:
+            self._rows.append(self._row)
+            # decrement owed-rowspans
+            self._rowspan_owed = [max(0, n - 1) for n in self._rowspan_owed]
+            self._row = None
+        elif tag in ("td", "th") and self._row is not None and self._cell_text is not None:
+            text = _clean_cell_text(" ".join(self._cell_text))
+            style = CellStyle(bold=self._cell_is_th or self._bold_depth > 0)
+            cell = RichCell(text=text, style=style)
+            # find first empty slot (None) at the end
+            while self._row and self._row[-1] is None:
+                pass  # keep as-is
+            # append the real cell + colspan filler
+            target_idx = len(self._row)
+            # if this position was reserved by a rowspan, shift right
+            while target_idx < len(self._row) and self._row[target_idx] is not None:
+                target_idx += 1
+            while len(self._row) < target_idx:
+                self._row.append(None)
+            self._row.append(cell)
+            for _ in range(self._cell_colspan - 1):
+                self._row.append(RichCell())
+            # register rowspan so subsequent rows skip this column
+            if self._cell_rowspan > 1:
+                col_idx = len(self._row) - self._cell_colspan
+                while len(self._rowspan_owed) <= col_idx:
+                    self._rowspan_owed.append(0)
+                self._rowspan_owed[col_idx] = max(
+                    self._rowspan_owed[col_idx], self._cell_rowspan - 1
+                )
+            self._cell_text = None
+            self._cell_is_th = False
+            self._cell_colspan = 1
+            self._cell_rowspan = 1
+        elif tag in ("b", "strong"):
+            self._bold_depth = max(0, self._bold_depth - 1)
+
+    def handle_data(self, data):
+        if self._cell_text is not None:
+            self._cell_text.append(data)
+
+    def result(self) -> list[list[RichCell]]:
+        return [
+            [(c if c is not None else RichCell()) for c in row]
+            for row in self._rows
+        ]
+
+
+def _parse_html_table(html: str) -> Optional[RichTable]:
+    if not html or "<" not in html:
         return None
     try:
-        images = convert_from_path(pdf_path, dpi=300, first_page=page_num, last_page=page_num)
-        if not images:
-            return None
-        data = pytesseract.image_to_data(images[0], output_type=pytesseract.Output.DICT)
-        lines: dict[tuple, list[tuple]] = {}
-        for i, txt in enumerate(data["text"]):
-            if not txt or not txt.strip():
-                continue
-            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-            lines.setdefault(key, []).append((data["left"][i], txt.strip()))
-        rows: list[list[str]] = []
-        for key in sorted(lines.keys()):
-            words = sorted(lines[key], key=lambda x: x[0])
-            rows.append([w for _, w in words])
-        return _normalize_plain_table(rows) if rows else None
+        p = _HtmlTableParser()
+        p.feed(html)
+        p.close()
     except Exception as e:
-        logger.warning("OCR page %d failed: %s", page_num, e)
+        logger.warning("HTML table parse failed: %s", e)
         return None
+    rows = p.result()
+    return _normalize_rich_table(rows) if rows else None
+
+
+# ---------- Extraction: PaddleOCR PP-Structure (best for scanned tables) ----------
+
+def _get_paddle_engine():
+    """Lazily build a PP-Structure engine. Returns None if unavailable."""
+    global _PADDLE_ENGINE
+    if _PADDLE_ENGINE is False:
+        return None
+    if _PADDLE_ENGINE is not None:
+        return _PADDLE_ENGINE
+    if not _HAS_PADDLE:
+        _PADDLE_ENGINE = False
+        return None
+    try:
+        # PP-Structure detects layout (text/title/table/figure) and runs
+        # an OCR + a separate table-recognition model that emits HTML.
+        from paddleocr import PPStructure
+        logger.info("Initializing PP-Structure (downloads models on first use)…")
+        _PADDLE_ENGINE = PPStructure(
+            table=True,
+            ocr=True,
+            layout=True,
+            show_log=False,
+            lang="en",
+            use_gpu=False,
+        )
+        logger.info("PP-Structure ready.")
+        return _PADDLE_ENGINE
+    except Exception as e:
+        logger.warning("PP-Structure init failed; falling back: %s", e)
+        _PADDLE_ENGINE = False
+        return None
+
+
+def _paddle_extract_page(pdf_path: str, page_num: int) -> tuple[list[RichTable], list[str]]:
+    """Run PP-Structure on one page. Returns (tables, title_lines)."""
+    engine = _get_paddle_engine()
+    if engine is None:
+        return [], []
+
+    img = _render_page_image(pdf_path, page_num, dpi=300)
+    if img is None:
+        return [], []
+
+    try:
+        import numpy as np
+        arr = np.array(img)
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        elif arr.shape[-1] == 4:
+            arr = arr[..., :3]
+        result = engine(arr)
+    except Exception as e:
+        logger.warning("PP-Structure p%d failed: %s", page_num, e)
+        return [], []
+
+    # Sort regions top-to-bottom by their bbox y-min
+    def _y0(r):
+        b = r.get("bbox") or [0, 0, 0, 0]
+        try:
+            return float(b[1])
+        except Exception:
+            return 0.0
+    try:
+        result = sorted(result, key=_y0)
+    except Exception:
+        pass
+
+    tables: list[RichTable] = []
+    titles: list[str] = []
+
+    for region in result:
+        rtype = (region.get("type") or "").lower()
+        res = region.get("res")
+        if not res:
+            continue
+
+        if rtype == "table":
+            html = res.get("html", "") if isinstance(res, dict) else ""
+            rt = _parse_html_table(html)
+            if rt:
+                tables.append(rt)
+                continue
+            # If HTML failed, fall back to flat OCR lines from the region
+            cells = res.get("cells") if isinstance(res, dict) else None
+            if isinstance(cells, list) and cells:
+                lines = []
+                for c in cells:
+                    if isinstance(c, dict):
+                        t = (c.get("text") or "").strip()
+                        if t:
+                            lines.append(t)
+                if lines:
+                    tables.append([[RichCell(text=ln)] for ln in lines])
+
+        elif rtype == "title":
+            pieces = []
+            if isinstance(res, list):
+                for item in res:
+                    if isinstance(item, dict):
+                        pieces.append((item.get("text") or "").strip())
+                    elif isinstance(item, str):
+                        pieces.append(item.strip())
+            joined = " ".join(p for p in pieces if p)
+            if joined:
+                titles.append(joined)
+
+        elif rtype in ("text", "figure_caption", "header", "footer"):
+            lines = []
+            if isinstance(res, list):
+                for item in res:
+                    if isinstance(item, dict):
+                        t = (item.get("text") or "").strip()
+                        if t:
+                            lines.append(t)
+            if lines:
+                # Treat free text as a single-column "table" preserving line order
+                tables.append([[RichCell(text=ln)] for ln in lines])
+
+    return tables, titles
+
+
+# ---------- Extraction: smart Tesseract OCR (fallback) ----------
+
+def _extract_ocr_page(pdf_path: str, page_num: int) -> Optional[RichTable]:
+    """Tesseract OCR with row/column clustering — preserves table structure
+    far better than dumping words line-by-line."""
+    if not _HAS_TESSERACT:
+        return None
+    img = _render_page_image(pdf_path, page_num, dpi=400)
+    if img is None:
+        return None
+    try:
+        data = pytesseract.image_to_data(
+            img,
+            output_type=pytesseract.Output.DICT,
+            config="--psm 6 -c preserve_interword_spaces=1",
+        )
+    except Exception as e:
+        logger.warning("tesseract p%d failed: %s", page_num, e)
+        return None
+
+    words: list[dict] = []
+    for i in range(len(data["text"])):
+        txt = (data["text"][i] or "").strip()
+        try:
+            conf = int(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1
+        if not txt or conf < 30:
+            continue
+        words.append({
+            "text": txt,
+            "x": int(data["left"][i]),
+            "y": int(data["top"][i]),
+            "w": int(data["width"][i]),
+            "h": int(data["height"][i]),
+        })
+    return _build_table_from_words(words)
+
+
+def _build_table_from_words(words: list[dict]) -> Optional[RichTable]:
+    """Cluster word boxes into rows by y-overlap, then assign each word to
+    the column whose start it's nearest to (column starts found by 1-D
+    clustering of word x-positions across all rows)."""
+    if not words:
+        return None
+
+    # --- 1) cluster into rows by vertical overlap ---
+    sorted_words = sorted(words, key=lambda w: w["y"])
+    rows: list[list[dict]] = []
+    for w in sorted_words:
+        wt, wb = w["y"], w["y"] + w["h"]
+        placed = False
+        for row in rows:
+            rt = min(x["y"] for x in row)
+            rb = max(x["y"] + x["h"] for x in row)
+            overlap = min(wb, rb) - max(wt, rt)
+            if overlap > min(w["h"], rb - rt) * 0.4:
+                row.append(w)
+                placed = True
+                break
+        if not placed:
+            rows.append([w])
+    rows.sort(key=lambda r: sum(x["y"] for x in r) / len(r))
+    rows = [sorted(r, key=lambda x: x["x"]) for r in rows]
+
+    # --- 2) find column starts via 1-D clustering of x-positions ---
+    median_w = sorted(w["w"] for w in words)[len(words) // 2]
+    col_tol = max(15, int(median_w * 0.5))
+
+    starts = sorted(w["x"] for w in words)
+    clusters: list[list[int]] = []
+    for x in starts:
+        if not clusters or x - clusters[-1][-1] > col_tol:
+            clusters.append([x])
+        else:
+            clusters[-1].append(x)
+
+    # Drop very weak clusters (probably noise)
+    n_total = max(1, len(starts))
+    strong = [c for c in clusters if len(c) >= max(2, int(n_total * 0.04))]
+    if not strong:
+        strong = clusters
+    col_starts = [c[0] for c in strong]
+
+    if len(col_starts) <= 1:
+        flat = [[RichCell(text=" ".join(w["text"] for w in row))] for row in rows]
+        return _normalize_rich_table(flat)
+
+    def col_of(x: int) -> int:
+        ci = 0
+        for i, cs in enumerate(col_starts):
+            if x + col_tol // 2 >= cs:
+                ci = i
+            else:
+                break
+        return ci
+
+    n_cols = len(col_starts)
+    out: list[list[RichCell]] = []
+    for row in rows:
+        cells = [""] * n_cols
+        for w in row:
+            ci = col_of(w["x"])
+            cells[ci] = (cells[ci] + " " + w["text"]).strip() if cells[ci] else w["text"]
+        out.append([RichCell(text=c) for c in cells])
+    return _normalize_rich_table(out)
 
 
 # ---------- Pipeline ----------
@@ -320,10 +700,6 @@ def convert_pdf_to_workbook(pdf_path: str, pages: Optional[set[int]] = None) -> 
     lattice = _camelot_pages(pdf_path, "lattice", page_count, pages=pages)
     stream = _camelot_pages(pdf_path, "stream", page_count, pages=pages)
 
-    pp_total_tables = sum(len(r.tables) for r in pp_results)
-    cm_total = sum(len(v) for v in lattice.values()) + sum(len(v) for v in stream.values())
-    do_ocr = (pp_total_tables == 0 and cm_total == 0) and _HAS_OCR
-
     chosen: list[PageResult] = []
     for r in pp_results:
         candidates: list[tuple[float, str, list[RichTable], list[str]]] = []
@@ -334,15 +710,35 @@ def convert_pdf_to_workbook(pdf_path: str, pages: Optional[set[int]] = None) -> 
         if r.page_num in stream:
             ts = stream[r.page_num]
             candidates.append((sum(_score_table(t) for t in ts), "camelot-stream", ts, []))
-        if do_ocr:
-            ocr_t = _extract_ocr_page(pdf_path, r.page_num)
-            if ocr_t:
-                candidates.append((_score_table(ocr_t), "ocr", [ocr_t], []))
+
+        # ---- decide whether to OCR this page ----
+        # Scanned pages have no native text layer. Also OCR if every native
+        # extractor came back empty / very low confidence.
+        best_native = max((c[0] for c in candidates), default=0.0)
+        is_scanned = r.char_count < 5
+        weak_native = best_native < 1.0 and sum(len(c[2]) for c in candidates) == 0
+        if is_scanned or weak_native:
+            # Prefer Paddle PP-Structure (table-aware, layout-aware)
+            p_tables, p_titles = _paddle_extract_page(pdf_path, r.page_num)
+            if p_tables:
+                # Slight bias so a successful OCR run wins ties against an
+                # empty pdfplumber result on the same page.
+                paddle_score = sum(_score_table(t) for t in p_tables) + 0.5
+                candidates.append((paddle_score, "paddle-ocr", p_tables, p_titles))
+            else:
+                # Fall back to Tesseract with smart clustering
+                ocr_t = _extract_ocr_page(pdf_path, r.page_num)
+                if ocr_t:
+                    candidates.append((_score_table(ocr_t), "tesseract-ocr", [ocr_t], []))
+
         score, method, tables, titles = max(candidates, key=lambda c: c[0]) \
             if candidates else (0.0, "none", [], [])
+        if method.endswith("ocr"):
+            logger.info("Page %d → %s (score %.2f, native chars=%d)",
+                        r.page_num, method, score, r.char_count)
         chosen.append(PageResult(
             page_num=r.page_num, tables=tables, title_lines=titles,
-            method=method, score=score,
+            method=method, score=score, char_count=r.char_count,
         ))
 
     return _build_workbook(chosen)
@@ -545,7 +941,11 @@ def _build_workbook(pages: list[PageResult]) -> Workbook:
     if not any_content:
         ws = wb.create_sheet(title="No tables found")
         ws["A1"] = "No tables were detected in this PDF."
-        ws["A2"] = "If the PDF is scanned, ensure Tesseract & Poppler are installed."
+        if not _HAS_PADDLE and not _HAS_TESSERACT:
+            ws["A2"] = "No OCR engine is installed."
+            ws["A3"] = "Install paddleocr+paddlepaddle (recommended) or tesseract."
+        else:
+            ws["A2"] = "OCR ran but found no structured content on any page."
 
     return wb
 

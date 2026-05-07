@@ -4,11 +4,19 @@ python-multipart>=0.0.12
 pdfplumber>=0.11.4
 camelot-py[cv]>=0.11.0
 opencv-python-headless>=4.10
-pdf2image>=1.17
-pytesseract>=0.3.13
+PyMuPDF>=1.24
 Pillow>=10.4
 openpyxl>=3.1.5
 pandas>=2.2
 numpy>=1.26
 ghostscript>=0.7
 pypdf>=5.0
+
+# OCR (best-of-the-best, layout-aware, all pip-installable, no system deps)
+paddlepaddle>=2.6
+paddleocr>=2.7
+
+# Tesseract fallback (only used if Paddle fails to load).
+# Requires system Tesseract binary; install is optional.
+pytesseract>=0.3.13
+pdf2image>=1.17
