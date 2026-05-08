@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pypdf import PdfReader, PdfWriter
 
-from .converter import convert_pdf_bytes_to_xlsx_bytes, parse_page_spec
+from .converter import convert_pdf_bytes, parse_page_spec
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("boss-pdf")
@@ -95,17 +95,34 @@ async def convert(file: UploadFile = File(...),
 
     log.info("converting %s (%d bytes) pages=%s", file.filename, len(pdf_bytes), pages or "all")
     try:
-        xlsx_bytes = convert_pdf_bytes_to_xlsx_bytes(pdf_bytes, pages=page_set)
+        result = convert_pdf_bytes(pdf_bytes, pages=page_set, filename=file.filename)
     except Exception as e:
         log.exception("conversion failed")
         raise HTTPException(status_code=500, detail=f"Conversion failed: {e}") from e
 
     stem = os.path.splitext(_safe_filename(file.filename))[0]
-    out_name = f"{stem}.xlsx"
-    headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+
+    # Bundle xlsx + diagnostic log + (when OCR ran) selectable-text preview.
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{stem}.xlsx", result.xlsx_bytes)
+        zf.writestr("boss-pdf-log.txt", result.log_text)
+        if result.preview_html:
+            zf.writestr("ocr-preview.html", result.preview_html)
+    zip_buf.seek(0)
+
+    out_name = f"{stem}.zip"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{out_name}"',
+        "X-Boss-OCR-Used": "true" if result.ocr_used else "false",
+        "X-Boss-OCR-Engine": result.ocr_engine or "",
+        "X-Boss-Pages": str(len(result.pages_summary)),
+        "Access-Control-Expose-Headers":
+            "X-Boss-OCR-Used, X-Boss-OCR-Engine, X-Boss-Pages",
+    }
     return StreamingResponse(
-        io.BytesIO(xlsx_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        zip_buf,
+        media_type="application/zip",
         headers=headers,
     )
 

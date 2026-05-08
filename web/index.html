@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;0,9..144,800;1,9..144,600;1,9..144,700;1,9..144,800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=6" />
+  <link rel="stylesheet" href="/static/style.css?v=7" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
           crossorigin="anonymous"
           referrerpolicy="no-referrer"></script>
@@ -157,9 +157,24 @@
     <section id="result" class="card hidden">
       <div class="ok">The boss approves.</div>
       <p class="boss-sub" id="resultMsg">Your spreadsheet is ready, kid.</p>
+
+      <div id="engineBadgeRow" class="engine-row hidden">
+        <span class="engine-label">extracted via</span>
+        <span id="engineBadge" class="engine-badge">native text</span>
+      </div>
+
+      <div id="ocrPreviewWrap" class="hidden">
+        <div class="preview-header">
+          <span class="preview-label">OCR preview · select text to verify</span>
+          <span class="preview-hint">if it reads cleanly, OCR worked. if it's garbled, hit "Discard".</span>
+        </div>
+        <iframe id="ocrPreviewFrame" class="ocr-preview-frame" sandbox="allow-same-origin" title="OCR preview"></iframe>
+      </div>
+
       <div class="row-actions">
-        <a id="downloadLink" class="primary" download>Download .xlsx</a>
+        <a id="downloadLink" class="primary" download>Save .zip (xlsx + log)</a>
         <button id="againBtn" class="ghost" type="button">Boss another file</button>
+        <button id="discardBtn" class="ghost hidden" type="button">Discard — OCR looks bad</button>
       </div>
     </section>
 
@@ -185,6 +200,6 @@
     <small>boss-pdf · runs locally · files never leave your machine</small>
   </footer>
 
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=7"></script>
 </body>
 </html>

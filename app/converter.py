@@ -55,7 +55,8 @@ except Exception as e:
     logger.info("paddleocr not available: %s", e)
     _HAS_PADDLE = False
 
-_PADDLE_ENGINE = None  # cached PPStructure instance (or False if init failed)
+_PADDLE_ENGINE = None  # cached engine (or False if init failed)
+_PADDLE_API_VERSION = 0  # 0=none, 2=PPStructure (legacy), 3=PPStructureV3
 
 # RapidOCR: ONNX-based port of PaddleOCR. Lighter, broader Python compat,
 # no paddlepaddle dep. Used as primary OCR engine when paddle isn't available.
@@ -474,8 +475,12 @@ def _parse_html_table(html: str) -> Optional[RichTable]:
 # ---------- Extraction: PaddleOCR PP-Structure (best for scanned tables) ----------
 
 def _get_paddle_engine():
-    """Lazily build a PP-Structure engine. Returns None if unavailable."""
-    global _PADDLE_ENGINE
+    """Lazily build a PaddleOCR layout/table engine.
+
+    Tries paddleocr 3.x (PPStructureV3) first — the current SOTA pipeline —
+    then falls back to legacy PPStructure (paddleocr 2.x). Caches result.
+    """
+    global _PADDLE_ENGINE, _PADDLE_API_VERSION
     if _PADDLE_ENGINE is False:
         return None
     if _PADDLE_ENGINE is not None:
@@ -483,29 +488,49 @@ def _get_paddle_engine():
     if not _HAS_PADDLE:
         _PADDLE_ENGINE = False
         return None
+
+    # ---- paddleocr 3.x: PPStructureV3 (preferred) ----
     try:
-        # PP-Structure detects layout (text/title/table/figure) and runs
-        # an OCR + a separate table-recognition model that emits HTML.
-        from paddleocr import PPStructure
-        logger.info("Initializing PP-Structure (downloads models on first use)…")
+        from paddleocr import PPStructureV3  # type: ignore
+        logger.info("Initializing PPStructureV3 (paddleocr 3.x; downloads models on first use)…")
+        try:
+            _PADDLE_ENGINE = PPStructureV3(
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+        except TypeError:
+            # Some 3.x point releases use slightly different kwarg names
+            _PADDLE_ENGINE = PPStructureV3()
+        _PADDLE_API_VERSION = 3
+        logger.info("PPStructureV3 ready (paddleocr v3 API).")
+        return _PADDLE_ENGINE
+    except ImportError:
+        logger.debug("PPStructureV3 not available; trying legacy PPStructure.")
+    except Exception as e:
+        logger.warning("PPStructureV3 init failed: %s", e)
+
+    # ---- paddleocr 2.x: PPStructure (legacy fallback) ----
+    try:
+        from paddleocr import PPStructure  # type: ignore
+        logger.info("Initializing PPStructure (paddleocr 2.x)…")
         _PADDLE_ENGINE = PPStructure(
-            table=True,
-            ocr=True,
-            layout=True,
-            show_log=False,
-            lang="en",
-            use_gpu=False,
+            table=True, ocr=True, layout=True,
+            show_log=False, lang="en", use_gpu=False,
         )
-        logger.info("PP-Structure ready.")
+        _PADDLE_API_VERSION = 2
+        logger.info("PPStructure ready (paddleocr v2 API).")
         return _PADDLE_ENGINE
     except Exception as e:
-        logger.warning("PP-Structure init failed; falling back: %s", e)
-        _PADDLE_ENGINE = False
-        return None
+        logger.warning("PPStructure init failed: %s", e)
+
+    _PADDLE_ENGINE = False
+    return None
 
 
 def _paddle_extract_page(pdf_path: str, page_num: int) -> tuple[list[RichTable], list[str]]:
-    """Run PP-Structure on one page. Returns (tables, title_lines)."""
+    """Run paddleocr layout/table pipeline on one page. Handles both
+    PPStructureV3 (v3.x, current SOTA) and legacy PPStructure (v2.x)."""
     engine = _get_paddle_engine()
     if engine is None:
         return [], []
@@ -521,12 +546,117 @@ def _paddle_extract_page(pdf_path: str, page_num: int) -> tuple[list[RichTable],
             arr = np.stack([arr] * 3, axis=-1)
         elif arr.shape[-1] == 4:
             arr = arr[..., :3]
-        result = engine(arr)
     except Exception as e:
-        logger.warning("PP-Structure p%d failed: %s", page_num, e)
+        logger.warning("paddle prep p%d failed: %s", page_num, e)
         return [], []
 
-    # Sort regions top-to-bottom by their bbox y-min
+    if _PADDLE_API_VERSION == 3:
+        return _paddle_v3_extract(engine, arr, page_num)
+    return _paddle_v2_extract(engine, arr, page_num)
+
+
+def _paddle_v3_extract(engine, arr, page_num: int) -> tuple[list[RichTable], list[str]]:
+    """PPStructureV3 result schema:
+       result = [ {'table_res_list': [...], 'overall_ocr_res': {...}, ...} ]"""
+    try:
+        result = engine.predict(arr)
+    except Exception as e:
+        logger.warning("PPStructureV3 predict p%d failed: %s", page_num, e)
+        return [], []
+    if not result:
+        return [], []
+
+    # PPStructureV3 returns one result-object per input image. Single image -> [0].
+    page = result[0] if isinstance(result, list) else result
+    # 3.x output objects expose attribute-style access via .json/.dict but in
+    # most builds also act as dicts. Read defensively.
+    def _get(o, key, default=None):
+        if isinstance(o, dict):
+            return o.get(key, default)
+        return getattr(o, key, default)
+
+    tables: list[RichTable] = []
+    titles: list[str] = []
+
+    # ---- tables ----
+    table_res_list = _get(page, "table_res_list") or []
+    for tr in table_res_list:
+        html = _get(tr, "pred_html") or _get(tr, "html") or ""
+        rt = _parse_html_table(html)
+        if rt:
+            tables.append(rt)
+            logger.debug("paddle v3 p%d: table parsed (%d rows × %d cols)",
+                         page_num, len(rt), len(rt[0]) if rt else 0)
+            continue
+        # Fall back to cell-level reconstruction if html parse failed
+        cells = _get(tr, "cell_box_list") or _get(tr, "cells") or []
+        if cells:
+            words = []
+            for c in cells:
+                txt = _get(c, "text") or _get(c, "rec_text") or ""
+                txt = (txt or "").strip()
+                if not txt:
+                    continue
+                box = _get(c, "box") or _get(c, "bbox")
+                if box and len(box) >= 4:
+                    try:
+                        x0, y0, x1, y1 = (float(box[0]), float(box[1]),
+                                          float(box[2]), float(box[3]))
+                        words.append({
+                            "text": txt,
+                            "x": int(x0), "y": int(y0),
+                            "w": max(1, int(x1 - x0)),
+                            "h": max(1, int(y1 - y0)),
+                        })
+                    except (TypeError, ValueError):
+                        pass
+            if words:
+                rt = _build_table_from_words(words)
+                if rt:
+                    tables.append(rt)
+
+    # ---- standalone OCR text (only used if no tables found) ----
+    if not tables:
+        ocr_res = _get(page, "overall_ocr_res") or {}
+        rec_texts = _get(ocr_res, "rec_texts") or []
+        rec_polys = _get(ocr_res, "rec_polys") or []
+        if rec_texts and rec_polys and len(rec_texts) == len(rec_polys):
+            words = []
+            for txt, poly in zip(rec_texts, rec_polys):
+                txt = (txt or "").strip()
+                if not txt:
+                    continue
+                try:
+                    xs = [float(pt[0]) for pt in poly]
+                    ys = [float(pt[1]) for pt in poly]
+                except (TypeError, IndexError, ValueError):
+                    continue
+                x0, y0 = int(min(xs)), int(min(ys))
+                x1, y1 = int(max(xs)), int(max(ys))
+                words.append({
+                    "text": txt,
+                    "x": x0, "y": y0,
+                    "w": max(1, x1 - x0),
+                    "h": max(1, y1 - y0),
+                })
+            if words:
+                rt = _build_table_from_words(words)
+                if rt:
+                    tables.append(rt)
+                    logger.debug("paddle v3 p%d: OCR-only fallback (%d words → %d rows)",
+                                 page_num, len(words), len(rt))
+
+    return tables, titles
+
+
+def _paddle_v2_extract(engine, arr, page_num: int) -> tuple[list[RichTable], list[str]]:
+    """Legacy PPStructure (paddleocr 2.x) result schema."""
+    try:
+        result = engine(arr)
+    except Exception as e:
+        logger.warning("PPStructure p%d failed: %s", page_num, e)
+        return [], []
+
     def _y0(r):
         b = r.get("bbox") or [0, 0, 0, 0]
         try:
@@ -540,7 +670,6 @@ def _paddle_extract_page(pdf_path: str, page_num: int) -> tuple[list[RichTable],
 
     tables: list[RichTable] = []
     titles: list[str] = []
-
     for region in result:
         rtype = (region.get("type") or "").lower()
         res = region.get("res")
@@ -553,15 +682,11 @@ def _paddle_extract_page(pdf_path: str, page_num: int) -> tuple[list[RichTable],
             if rt:
                 tables.append(rt)
                 continue
-            # If HTML failed, fall back to flat OCR lines from the region
             cells = res.get("cells") if isinstance(res, dict) else None
             if isinstance(cells, list) and cells:
-                lines = []
-                for c in cells:
-                    if isinstance(c, dict):
-                        t = (c.get("text") or "").strip()
-                        if t:
-                            lines.append(t)
+                lines = [(c.get("text") or "").strip()
+                         for c in cells if isinstance(c, dict)]
+                lines = [ln for ln in lines if ln]
                 if lines:
                     tables.append([[RichCell(text=ln)] for ln in lines])
 
@@ -586,7 +711,6 @@ def _paddle_extract_page(pdf_path: str, page_num: int) -> tuple[list[RichTable],
                         if t:
                             lines.append(t)
             if lines:
-                # Treat free text as a single-column "table" preserving line order
                 tables.append([[RichCell(text=ln)] for ln in lines])
 
     return tables, titles
@@ -788,6 +912,16 @@ def _build_table_from_words(words: list[dict]) -> Optional[RichTable]:
 # ---------- Pipeline ----------
 
 def convert_pdf_to_workbook(pdf_path: str, pages: Optional[set[int]] = None) -> Workbook:
+    """Backward-compatible wrapper. Returns just the Workbook."""
+    wb, _summary = _convert_pdf_to_workbook_full(pdf_path, pages=pages)
+    return wb
+
+
+def _convert_pdf_to_workbook_full(
+    pdf_path: str, pages: Optional[set[int]] = None,
+) -> tuple[Workbook, list[PageResult]]:
+    """Build the workbook AND return the per-page method/score summary.
+    The summary is what the diagnostic log reports on."""
     pp_results = _extract_pdfplumber(pdf_path, pages=pages)
     if pages is not None:
         page_count = max(pages) if pages else 0
@@ -798,50 +932,79 @@ def convert_pdf_to_workbook(pdf_path: str, pages: Optional[set[int]] = None) -> 
 
     chosen: list[PageResult] = []
     for r in pp_results:
+        logger.info("--- Page %d (chars=%d) ---", r.page_num, r.char_count)
         candidates: list[tuple[float, str, list[RichTable], list[str]]] = []
         candidates.append((r.score, "pdfplumber", r.tables, r.title_lines))
+        logger.info("  pdfplumber: %d tables, score=%.2f",
+                    len(r.tables), r.score)
         if r.page_num in lattice:
             ts = lattice[r.page_num]
-            candidates.append((sum(_score_table(t) for t in ts), "camelot-lattice", ts, []))
+            sc = sum(_score_table(t) for t in ts)
+            candidates.append((sc, "camelot-lattice", ts, []))
+            logger.info("  camelot/lattice: %d tables, score=%.2f", len(ts), sc)
         if r.page_num in stream:
             ts = stream[r.page_num]
-            candidates.append((sum(_score_table(t) for t in ts), "camelot-stream", ts, []))
+            sc = sum(_score_table(t) for t in ts)
+            candidates.append((sc, "camelot-stream", ts, []))
+            logger.info("  camelot/stream:  %d tables, score=%.2f", len(ts), sc)
 
-        # ---- decide whether to OCR this page ----
-        # Scanned pages have no native text layer. Also OCR if every native
-        # extractor came back empty / very low confidence.
+        # ---- OCR routing ----
         best_native = max((c[0] for c in candidates), default=0.0)
         is_scanned = r.char_count < 5
         weak_native = best_native < 1.0 and sum(len(c[2]) for c in candidates) == 0
         if is_scanned or weak_native:
-            # 1. PaddleOCR PP-Structure (best — layout + table-aware HTML)
+            why = "no text layer" if is_scanned else "native extractors empty"
+            logger.info("  → OCR routing (%s)", why)
+
+            # 1. PaddleOCR (PPStructureV3 if 3.x installed, else PPStructure)
             p_tables, p_titles = _paddle_extract_page(pdf_path, r.page_num)
             if p_tables:
-                paddle_score = sum(_score_table(t) for t in p_tables) + 0.5
-                candidates.append((paddle_score, "paddle-ocr", p_tables, p_titles))
+                sc = sum(_score_table(t) for t in p_tables) + 0.5
+                tag = f"paddle-ocr-v{_PADDLE_API_VERSION}" if _PADDLE_API_VERSION else "paddle-ocr"
+                candidates.append((sc, tag, p_tables, p_titles))
+                logger.info("  paddle (%s): %d tables, score=%.2f",
+                            tag, len(p_tables), sc)
             else:
-                # 2. RapidOCR (ONNX, no paddlepaddle dep — same models)
+                if _HAS_PADDLE:
+                    logger.info("  paddle: produced no tables on this page")
+                # 2. RapidOCR (ONNX, no paddle dep)
                 r_tables, r_titles = _rapidocr_extract_page(pdf_path, r.page_num)
                 if r_tables:
-                    rapid_score = sum(_score_table(t) for t in r_tables) + 0.4
-                    candidates.append((rapid_score, "rapidocr", r_tables, r_titles))
-                elif _HAS_TESSERACT:
-                    # 3. Tesseract with row/column clustering (last resort)
+                    sc = sum(_score_table(t) for t in r_tables) + 0.4
+                    candidates.append((sc, "rapidocr", r_tables, r_titles))
+                    logger.info("  rapidocr: %d tables, score=%.2f",
+                                len(r_tables), sc)
+                elif _HAS_RAPIDOCR:
+                    logger.info("  rapidocr: produced no tables on this page")
+                # 3. Tesseract (last resort)
+                if not p_tables and not r_tables and _HAS_TESSERACT:
                     ocr_t = _extract_ocr_page(pdf_path, r.page_num)
                     if ocr_t:
-                        candidates.append((_score_table(ocr_t), "tesseract-ocr", [ocr_t], []))
+                        sc = _score_table(ocr_t)
+                        candidates.append((sc, "tesseract-ocr", [ocr_t], []))
+                        logger.info("  tesseract: 1 table, score=%.2f", sc)
+
+            # If still nothing, log which engines weren't even available
+            if all(c[1] in ("pdfplumber", "camelot-lattice", "camelot-stream")
+                   for c in candidates):
+                missing = []
+                if not _HAS_PADDLE: missing.append("paddleocr")
+                if not _HAS_RAPIDOCR: missing.append("rapidocr-onnxruntime")
+                if not _HAS_TESSERACT: missing.append("tesseract")
+                if missing:
+                    logger.warning("  no OCR engine produced output. Missing: %s",
+                                   ", ".join(missing))
 
         score, method, tables, titles = max(candidates, key=lambda c: c[0]) \
             if candidates else (0.0, "none", [], [])
-        if method.endswith("ocr"):
-            logger.info("Page %d → %s (score %.2f, native chars=%d)",
-                        r.page_num, method, score, r.char_count)
+        logger.info("  CHOSEN: %s (score %.2f, %d table%s)",
+                    method, score, len(tables), "" if len(tables) == 1 else "s")
         chosen.append(PageResult(
             page_num=r.page_num, tables=tables, title_lines=titles,
             method=method, score=score, char_count=r.char_count,
         ))
 
-    return _build_workbook(chosen)
+    return _build_workbook(chosen), chosen
 
 
 # ---------- Excel rendering ----------
@@ -1057,21 +1220,188 @@ def _build_workbook(pages: list[PageResult]) -> Workbook:
     return wb
 
 
+@dataclass
+class ConvertResult:
+    """Everything produced by one conversion run."""
+    xlsx_bytes: bytes
+    log_text: str
+    ocr_used: bool
+    ocr_engine: str  # which OCR was used (or "" if none)
+    pages_summary: list[dict]  # [{page, method, score, tables, chars}, ...]
+    preview_html: Optional[str] = None  # selectable-text preview of OCR'd content
+
+
+def _engine_availability_block() -> str:
+    """Produce the leading 'capability' block of the log file."""
+    rows = [
+        ("pdfplumber", True, "always (core)"),
+        ("camelot",    _HAS_CAMELOT,    "tables w/ borders"),
+        ("PyMuPDF",    _HAS_FITZ,       "page → image"),
+        ("PaddleOCR",  _HAS_PADDLE,     "best OCR (table-aware)"),
+        ("RapidOCR",   _HAS_RAPIDOCR,   "ONNX OCR (no paddle dep)"),
+        ("Tesseract",  _HAS_TESSERACT,  "OCR fallback"),
+    ]
+    paddle_note = ""
+    if _HAS_PADDLE:
+        paddle_note = f" (api v{_PADDLE_API_VERSION})" if _PADDLE_API_VERSION else " (init pending)"
+    out = ["=== boss-pdf · conversion log ===", ""]
+    out.append("Available engines:")
+    for name, ok, note in rows:
+        flag = "✓" if ok else "✗"
+        extra = paddle_note if name == "PaddleOCR" else ""
+        out.append(f"  {flag} {name:<11} {note}{extra}")
+    out.append("")
+    return "\n".join(out)
+
+
+def _render_preview_html(pages_summary: list[dict],
+                         pages_tables: dict[int, list[RichTable]],
+                         filename: str) -> str:
+    """Render a standalone HTML file showing OCR'd content per page so the
+    user can verify (selectable text → OCR worked)."""
+    parts = [
+        "<!DOCTYPE html>",
+        "<html lang='en'><head><meta charset='utf-8'>",
+        f"<title>boss-pdf · OCR preview · {_h(filename)}</title>",
+        "<style>",
+        "body{font-family:-apple-system,'Segoe UI',Inter,sans-serif;",
+        "max-width:980px;margin:0 auto;padding:32px;background:#0d0e16;color:#f1eee7}",
+        "h1{font-family:Georgia,serif;color:#c9a15a;margin:0 0 6px;font-size:30px}",
+        ".lede{color:#9a9485;font-style:italic;margin:0 0 28px}",
+        ".page{background:#171823;border:1px solid #2a2d3b;border-radius:14px;",
+        "padding:20px 22px;margin:16px 0}",
+        "h2{font-family:Georgia,serif;font-size:18px;margin:0 0 4px;color:#f1eee7}",
+        ".meta{color:#7a7585;font-size:12px;margin-bottom:12px;letter-spacing:.3px}",
+        "table{border-collapse:collapse;width:100%;font-size:13.5px;background:#fbfaf6;color:#0d0e16}",
+        "td,th{border:1px solid #d8d3c4;padding:6px 8px;vertical-align:top;text-align:left}",
+        "th{background:#e8dfc6}",
+        "pre{white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace;",
+        "background:#0a0b12;border:1px solid #2a2d3b;color:#f1eee7;padding:14px;",
+        "border-radius:8px;line-height:1.55;font-size:13px}",
+        ".ok{color:#5fdfb0}.warn{color:#e0bd72}",
+        "</style></head><body>",
+        f"<h1>{_h(filename)} · OCR preview</h1>",
+        "<p class='lede'>If the text below is <strong>readable and selectable</strong>, ",
+        "OCR worked — you can use the .xlsx alongside this file. ",
+        "If it looks garbled, check <code>boss-pdf-log.txt</code> in the same zip.</p>",
+    ]
+    for s in pages_summary:
+        method = s["method"]
+        if not method.endswith("ocr"):
+            continue  # only show pages that actually went through OCR
+        pn = s["page"]
+        parts.append("<div class='page'>")
+        parts.append(f"<h2>Page {pn}</h2>")
+        parts.append(f"<div class='meta'>method: <strong>{_h(method)}</strong> · "
+                     f"score: {s['score']:.2f} · "
+                     f"native chars on page: {s['chars']}</div>")
+        tables = pages_tables.get(pn) or []
+        if not tables:
+            parts.append("<pre class='warn'>(no content extracted)</pre>")
+        for t in tables:
+            parts.append(_richtable_to_html(t))
+        parts.append("</div>")
+    parts.append("</body></html>")
+    return "\n".join(parts)
+
+
+def _h(s: str) -> str:
+    """Tiny HTML escape."""
+    return (str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def _richtable_to_html(t: RichTable) -> str:
+    if not t:
+        return ""
+    out = ["<table>"]
+    for ri, row in enumerate(t):
+        out.append("<tr>")
+        for c in row:
+            tag = "th" if ri == 0 and any(cc.style.bold for cc in row) else "td"
+            txt = _h(c.text or "").replace("\n", "<br>")
+            style = ""
+            if c.style.bold:
+                style += "font-weight:700;"
+            if c.style.color_hex and c.style.color_hex != "000000":
+                style += f"color:#{c.style.color_hex};"
+            attr = f" style='{style}'" if style else ""
+            out.append(f"<{tag}{attr}>{txt}</{tag}>")
+        out.append("</tr>")
+    out.append("</table>")
+    return "".join(out)
+
+
 def convert_pdf_bytes_to_xlsx_bytes(pdf_bytes: bytes,
                                     pages: Optional[set[int]] = None) -> bytes:
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-        f.write(pdf_bytes)
-        tmp_path = f.name
+    """Backward-compatible: returns just the xlsx bytes."""
+    return convert_pdf_bytes(pdf_bytes, pages=pages, filename="").xlsx_bytes
+
+
+def convert_pdf_bytes(pdf_bytes: bytes,
+                      pages: Optional[set[int]] = None,
+                      filename: str = "") -> ConvertResult:
+    """Run the full pipeline and return ConvertResult: xlsx + log + preview."""
+    # Capture every log message emitted from this module during the run.
+    log_buf = io.StringIO()
+    handler = logging.StreamHandler(log_buf)
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                                           datefmt="%H:%M:%S"))
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+
+    log_buf.write(_engine_availability_block())
+    logger.info("Input: %s (%d bytes)%s",
+                filename or "<unnamed>", len(pdf_bytes),
+                f", pages filter: {sorted(pages)}" if pages else "")
+
     try:
-        wb = convert_pdf_to_workbook(tmp_path, pages=pages)
-        buf = io.BytesIO()
-        wb.save(buf)
-        return buf.getvalue()
-    finally:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(pdf_bytes)
+            tmp_path = f.name
         try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+            wb, page_results = _convert_pdf_to_workbook_full(tmp_path, pages=pages)
+            buf = io.BytesIO()
+            wb.save(buf)
+            xlsx_bytes = buf.getvalue()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+    pages_summary = [
+        {"page": p.page_num, "method": p.method, "score": p.score,
+         "tables": len(p.tables), "chars": p.char_count}
+        for p in page_results
+    ]
+    ocr_used = any(p.method.endswith("ocr") for p in page_results)
+    ocr_engine = next(
+        (p.method for p in page_results if p.method.endswith("ocr")),
+        "",
+    )
+    preview_html = None
+    if ocr_used:
+        pages_tables = {p.page_num: p.tables for p in page_results}
+        preview_html = _render_preview_html(pages_summary, pages_tables,
+                                            filename or "document.pdf")
+
+    return ConvertResult(
+        xlsx_bytes=xlsx_bytes,
+        log_text=log_buf.getvalue(),
+        ocr_used=ocr_used,
+        ocr_engine=ocr_engine,
+        pages_summary=pages_summary,
+        preview_html=preview_html,
+    )
 
 
 # ---------- Page-range parsing ----------
