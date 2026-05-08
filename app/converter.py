@@ -57,6 +57,17 @@ except Exception as e:
 
 _PADDLE_ENGINE = None  # cached PPStructure instance (or False if init failed)
 
+# RapidOCR: ONNX-based port of PaddleOCR. Lighter, broader Python compat,
+# no paddlepaddle dep. Used as primary OCR engine when paddle isn't available.
+try:
+    import rapidocr_onnxruntime  # noqa: F401
+    _HAS_RAPIDOCR = True
+except Exception as e:
+    logger.info("rapidocr_onnxruntime not available: %s", e)
+    _HAS_RAPIDOCR = False
+
+_RAPIDOCR_ENGINE = None  # cached RapidOCR instance (or False if init failed)
+
 # Tesseract OCR (fallback only; needs system Tesseract binary).
 try:
     import pytesseract  # type: ignore
@@ -581,6 +592,91 @@ def _paddle_extract_page(pdf_path: str, page_num: int) -> tuple[list[RichTable],
     return tables, titles
 
 
+# ---------- Extraction: RapidOCR (pip-only, broad Python support) ----------
+
+def _get_rapidocr():
+    """Lazily build a RapidOCR engine. Returns None if unavailable."""
+    global _RAPIDOCR_ENGINE
+    if _RAPIDOCR_ENGINE is False:
+        return None
+    if _RAPIDOCR_ENGINE is not None:
+        return _RAPIDOCR_ENGINE
+    if not _HAS_RAPIDOCR:
+        _RAPIDOCR_ENGINE = False
+        return None
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        logger.info("Initializing RapidOCR (downloads models on first use)…")
+        _RAPIDOCR_ENGINE = RapidOCR()
+        logger.info("RapidOCR ready.")
+        return _RAPIDOCR_ENGINE
+    except Exception as e:
+        logger.warning("RapidOCR init failed: %s", e)
+        _RAPIDOCR_ENGINE = False
+        return None
+
+
+def _rapidocr_extract_page(pdf_path: str, page_num: int) -> tuple[list[RichTable], list[str]]:
+    """OCR a page with RapidOCR, then reconstruct the table layout from the
+    line-level bounding boxes via row/column clustering."""
+    engine = _get_rapidocr()
+    if engine is None:
+        return [], []
+
+    img = _render_page_image(pdf_path, page_num, dpi=300)
+    if img is None:
+        return [], []
+
+    try:
+        import numpy as np
+        arr = np.array(img)
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        elif arr.shape[-1] == 4:
+            arr = arr[..., :3]
+        result, _elapsed = engine(arr)
+    except Exception as e:
+        logger.warning("RapidOCR p%d failed: %s", page_num, e)
+        return [], []
+
+    if not result:
+        return [], []
+
+    # RapidOCR returns a list of [box, text, confidence] where box is 4 [x,y]
+    # corner points (clockwise from top-left). Convert each line into a
+    # word-like dict that _build_table_from_words can consume.
+    words: list[dict] = []
+    for entry in result:
+        try:
+            box = entry[0]
+            text = (entry[1] or "").strip()
+            conf = float(entry[2]) if len(entry) > 2 else 1.0
+        except (IndexError, TypeError, ValueError):
+            continue
+        if not text or conf < 0.3:
+            continue
+        try:
+            xs = [float(p[0]) for p in box]
+            ys = [float(p[1]) for p in box]
+        except (IndexError, TypeError, ValueError):
+            continue
+        x0, y0 = int(min(xs)), int(min(ys))
+        x1, y1 = int(max(xs)), int(max(ys))
+        words.append({
+            "text": text,
+            "x": x0,
+            "y": y0,
+            "w": max(1, x1 - x0),
+            "h": max(1, y1 - y0),
+        })
+
+    if not words:
+        return [], []
+
+    rt = _build_table_from_words(words)
+    return ([rt], []) if rt else ([], [])
+
+
 # ---------- Extraction: smart Tesseract OCR (fallback) ----------
 
 def _extract_ocr_page(pdf_path: str, page_num: int) -> Optional[RichTable]:
@@ -718,18 +814,22 @@ def convert_pdf_to_workbook(pdf_path: str, pages: Optional[set[int]] = None) -> 
         is_scanned = r.char_count < 5
         weak_native = best_native < 1.0 and sum(len(c[2]) for c in candidates) == 0
         if is_scanned or weak_native:
-            # Prefer Paddle PP-Structure (table-aware, layout-aware)
+            # 1. PaddleOCR PP-Structure (best — layout + table-aware HTML)
             p_tables, p_titles = _paddle_extract_page(pdf_path, r.page_num)
             if p_tables:
-                # Slight bias so a successful OCR run wins ties against an
-                # empty pdfplumber result on the same page.
                 paddle_score = sum(_score_table(t) for t in p_tables) + 0.5
                 candidates.append((paddle_score, "paddle-ocr", p_tables, p_titles))
             else:
-                # Fall back to Tesseract with smart clustering
-                ocr_t = _extract_ocr_page(pdf_path, r.page_num)
-                if ocr_t:
-                    candidates.append((_score_table(ocr_t), "tesseract-ocr", [ocr_t], []))
+                # 2. RapidOCR (ONNX, no paddlepaddle dep — same models)
+                r_tables, r_titles = _rapidocr_extract_page(pdf_path, r.page_num)
+                if r_tables:
+                    rapid_score = sum(_score_table(t) for t in r_tables) + 0.4
+                    candidates.append((rapid_score, "rapidocr", r_tables, r_titles))
+                elif _HAS_TESSERACT:
+                    # 3. Tesseract with row/column clustering (last resort)
+                    ocr_t = _extract_ocr_page(pdf_path, r.page_num)
+                    if ocr_t:
+                        candidates.append((_score_table(ocr_t), "tesseract-ocr", [ocr_t], []))
 
         score, method, tables, titles = max(candidates, key=lambda c: c[0]) \
             if candidates else (0.0, "none", [], [])
@@ -941,11 +1041,18 @@ def _build_workbook(pages: list[PageResult]) -> Workbook:
     if not any_content:
         ws = wb.create_sheet(title="No tables found")
         ws["A1"] = "No tables were detected in this PDF."
-        if not _HAS_PADDLE and not _HAS_TESSERACT:
+        engines = []
+        if _HAS_PADDLE: engines.append("PaddleOCR")
+        if _HAS_RAPIDOCR: engines.append("RapidOCR")
+        if _HAS_TESSERACT: engines.append("Tesseract")
+        if not engines:
             ws["A2"] = "No OCR engine is installed."
-            ws["A3"] = "Install paddleocr+paddlepaddle (recommended) or tesseract."
+            ws["A3"] = "Run: pip install rapidocr-onnxruntime PyMuPDF"
         else:
-            ws["A2"] = "OCR ran but found no structured content on any page."
+            ws["A2"] = f"OCR engines available: {', '.join(engines)}"
+            ws["A3"] = "But none could find structured content on these pages."
+            if not _HAS_FITZ:
+                ws["A4"] = "Tip: install PyMuPDF for reliable page rendering: pip install PyMuPDF"
 
     return wb
 
