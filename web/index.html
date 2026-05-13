@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;0,9..144,800;1,9..144,600;1,9..144,700;1,9..144,800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=8" />
+  <link rel="stylesheet" href="/static/style.css?v=9" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
           crossorigin="anonymous"
           referrerpolicy="no-referrer"></script>
@@ -104,6 +104,18 @@
 
       <div id="convThumbs" class="thumbgrid" aria-label="Pages"></div>
 
+      <label class="force-ocr-toggle">
+        <input type="checkbox" id="forceOcr" />
+        <span class="toggle-text">
+          <strong>Force OCR</strong>
+          <small>
+            Ignore the PDF's text layer and re-read every selected page with OCR.
+            Use this when the copyable text is garbage (e.g. <code>(cid:0)(cid:1)</code> glyph codes,
+            mojibake, wrong fonts) but the page <em>looks</em> readable.
+          </small>
+        </span>
+      </label>
+
       <div class="row-actions">
         <button id="convertBtn" class="primary" type="button">Make it Excel</button>
         <button id="convBack" class="ghost" type="button">← Back</button>
@@ -193,6 +205,6 @@
     <small>boss-pdf · runs locally · files never leave your machine</small>
   </footer>
 
-  <script src="/static/app.js?v=8"></script>
+  <script src="/static/app.js?v=9"></script>
 </body>
 </html>

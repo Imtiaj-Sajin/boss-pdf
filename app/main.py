@@ -106,7 +106,8 @@ async def pdf_info(file: UploadFile = File(...)) -> dict:
 
 @app.post("/api/convert")
 async def convert(file: UploadFile = File(...),
-                  pages: Optional[str] = Form(None)):
+                  pages: Optional[str] = Form(None),
+                  force_ocr: Optional[str] = Form(None)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a .pdf file.")
 
@@ -127,9 +128,16 @@ async def convert(file: UploadFile = File(...),
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
-    log.info("converting %s (%d bytes) pages=%s", file.filename, len(pdf_bytes), pages or "all")
+    force_flag = (force_ocr or "").lower() in ("true", "1", "yes", "on")
+
+    log.info("converting %s (%d bytes) pages=%s%s",
+             file.filename, len(pdf_bytes), pages or "all",
+             " FORCE_OCR" if force_flag else "")
     try:
-        result = convert_pdf_bytes(pdf_bytes, pages=page_set, filename=file.filename)
+        result = convert_pdf_bytes(
+            pdf_bytes, pages=page_set,
+            filename=file.filename, force_ocr=force_flag,
+        )
     except Exception as e:
         log.exception("conversion failed")
         raise HTTPException(status_code=500, detail=f"Conversion failed: {e}") from e

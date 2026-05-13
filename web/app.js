@@ -268,6 +268,8 @@ async function openConverter() {
   for (let i = 1; i <= pageCount; i++) convSelected.add(i);
   convFrom.value = 1; convFrom.max = pageCount;
   convTo.value = pageCount; convTo.max = pageCount;
+  const forceOcrEl = document.getElementById("forceOcr");
+  if (forceOcrEl) forceOcrEl.checked = false;
   showOnly(converterEl);
   updateConvSummary();
 
@@ -348,20 +350,25 @@ convertBtn.addEventListener("click", () => {
     return;
   }
   const spec = convSelected.size === pageCount ? "all" : compressPages(convSelected);
-  runConvert(currentFile, spec);
+  const forceOcrEl = document.getElementById("forceOcr");
+  const forceOcr = !!(forceOcrEl && forceOcrEl.checked);
+  runConvert(currentFile, spec, forceOcr);
 });
 
-function runConvert(file, pageSpec) {
+function runConvert(file, pageSpec, forceOcr) {
   fileNameEl.textContent = file.name;
   fileSizeEl.textContent = fmtSize(file.size);
   progressBar.style.width = "0%";
   progressBar.classList.remove("indeterminate");
-  statusMsg.textContent = "Filing it with the boss…";
+  statusMsg.textContent = forceOcr
+    ? "Filing it with the boss (force OCR)…"
+    : "Filing it with the boss…";
   showOnly(statusEl);
 
   const form = new FormData();
   form.append("file", file);
   if (pageSpec && pageSpec !== "all") form.append("pages", pageSpec);
+  if (forceOcr) form.append("force_ocr", "true");
 
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/api/convert");

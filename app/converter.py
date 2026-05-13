@@ -917,88 +917,117 @@ def convert_pdf_to_workbook(pdf_path: str, pages: Optional[set[int]] = None) -> 
     return wb
 
 
+def _run_ocr_candidates(pdf_path: str, page_num: int) -> list:
+    """Try every available OCR engine on this page. Returns scored candidates
+    in the same shape as native extractors: (score, method, tables, titles)."""
+    candidates: list[tuple[float, str, list[RichTable], list[str]]] = []
+
+    # 1. PaddleOCR (PP-StructureV3 on 3.x, PPStructure on 2.x)
+    p_tables, p_titles = _paddle_extract_page(pdf_path, page_num)
+    if p_tables:
+        sc = sum(_score_table(t) for t in p_tables) + 0.5
+        tag = f"paddle-ocr-v{_PADDLE_API_VERSION}" if _PADDLE_API_VERSION else "paddle-ocr"
+        candidates.append((sc, tag, p_tables, p_titles))
+        logger.info("  paddle (%s): %d tables, score=%.2f", tag, len(p_tables), sc)
+    elif _HAS_PADDLE:
+        logger.info("  paddle: produced no tables")
+
+    # 2. RapidOCR (ONNX-based)
+    r_tables, r_titles = _rapidocr_extract_page(pdf_path, page_num)
+    if r_tables:
+        sc = sum(_score_table(t) for t in r_tables) + 0.4
+        candidates.append((sc, "rapidocr", r_tables, r_titles))
+        logger.info("  rapidocr: %d tables, score=%.2f", len(r_tables), sc)
+    elif _HAS_RAPIDOCR:
+        logger.info("  rapidocr: produced no tables")
+
+    # 3. Tesseract — only if the others didn't fire (slow & weakest)
+    if not p_tables and not r_tables and _HAS_TESSERACT:
+        ocr_t = _extract_ocr_page(pdf_path, page_num)
+        if ocr_t:
+            sc = _score_table(ocr_t)
+            candidates.append((sc, "tesseract-ocr", [ocr_t], []))
+            logger.info("  tesseract: 1 table, score=%.2f", sc)
+
+    return candidates
+
+
 def _convert_pdf_to_workbook_full(
     pdf_path: str, pages: Optional[set[int]] = None,
+    force_ocr: bool = False,
 ) -> tuple[Workbook, list[PageResult]]:
     """Build the workbook AND return the per-page method/score summary.
-    The summary is what the diagnostic log reports on."""
+
+    When `force_ocr` is True, every selected page is OCR'd and the PDF's
+    text layer is ignored entirely (use this when the text layer is garbage
+    like ``(cid:N)`` glyph codes — copyable but meaningless)."""
     pp_results = _extract_pdfplumber(pdf_path, pages=pages)
     if pages is not None:
         page_count = max(pages) if pages else 0
     else:
         page_count = len(pp_results)
-    lattice = _camelot_pages(pdf_path, "lattice", page_count, pages=pages)
-    stream = _camelot_pages(pdf_path, "stream", page_count, pages=pages)
+
+    # Skip camelot in force-OCR mode — its output is also from the text layer
+    # we explicitly want to ignore.
+    if force_ocr:
+        lattice, stream = {}, {}
+    else:
+        lattice = _camelot_pages(pdf_path, "lattice", page_count, pages=pages)
+        stream = _camelot_pages(pdf_path, "stream", page_count, pages=pages)
 
     chosen: list[PageResult] = []
     for r in pp_results:
-        logger.info("--- Page %d (chars=%d) ---", r.page_num, r.char_count)
-        candidates: list[tuple[float, str, list[RichTable], list[str]]] = []
-        candidates.append((r.score, "pdfplumber", r.tables, r.title_lines))
-        logger.info("  pdfplumber: %d tables, score=%.2f",
-                    len(r.tables), r.score)
-        if r.page_num in lattice:
-            ts = lattice[r.page_num]
-            sc = sum(_score_table(t) for t in ts)
-            candidates.append((sc, "camelot-lattice", ts, []))
-            logger.info("  camelot/lattice: %d tables, score=%.2f", len(ts), sc)
-        if r.page_num in stream:
-            ts = stream[r.page_num]
-            sc = sum(_score_table(t) for t in ts)
-            candidates.append((sc, "camelot-stream", ts, []))
-            logger.info("  camelot/stream:  %d tables, score=%.2f", len(ts), sc)
-
-        # ---- OCR routing ----
-        best_native = max((c[0] for c in candidates), default=0.0)
-        is_scanned = r.char_count < 5
-        weak_native = best_native < 1.0 and sum(len(c[2]) for c in candidates) == 0
-        if is_scanned or weak_native:
-            why = "no text layer" if is_scanned else "native extractors empty"
-            logger.info("  → OCR routing (%s)", why)
-
-            # 1. PaddleOCR (PPStructureV3 if 3.x installed, else PPStructure)
-            p_tables, p_titles = _paddle_extract_page(pdf_path, r.page_num)
-            if p_tables:
-                sc = sum(_score_table(t) for t in p_tables) + 0.5
-                tag = f"paddle-ocr-v{_PADDLE_API_VERSION}" if _PADDLE_API_VERSION else "paddle-ocr"
-                candidates.append((sc, tag, p_tables, p_titles))
-                logger.info("  paddle (%s): %d tables, score=%.2f",
-                            tag, len(p_tables), sc)
-            else:
-                if _HAS_PADDLE:
-                    logger.info("  paddle: produced no tables on this page")
-                # 2. RapidOCR (ONNX, no paddle dep)
-                r_tables, r_titles = _rapidocr_extract_page(pdf_path, r.page_num)
-                if r_tables:
-                    sc = sum(_score_table(t) for t in r_tables) + 0.4
-                    candidates.append((sc, "rapidocr", r_tables, r_titles))
-                    logger.info("  rapidocr: %d tables, score=%.2f",
-                                len(r_tables), sc)
-                elif _HAS_RAPIDOCR:
-                    logger.info("  rapidocr: produced no tables on this page")
-                # 3. Tesseract (last resort)
-                if not p_tables and not r_tables and _HAS_TESSERACT:
-                    ocr_t = _extract_ocr_page(pdf_path, r.page_num)
-                    if ocr_t:
-                        sc = _score_table(ocr_t)
-                        candidates.append((sc, "tesseract-ocr", [ocr_t], []))
-                        logger.info("  tesseract: 1 table, score=%.2f", sc)
-
-            # If still nothing, log which engines weren't even available
-            if all(c[1] in ("pdfplumber", "camelot-lattice", "camelot-stream")
-                   for c in candidates):
+        if force_ocr:
+            logger.info("--- Page %d (FORCE OCR; native chars=%d ignored) ---",
+                        r.page_num, r.char_count)
+            candidates = _run_ocr_candidates(pdf_path, r.page_num)
+            if not candidates:
                 missing = []
                 if not _HAS_PADDLE: missing.append("paddleocr")
                 if not _HAS_RAPIDOCR: missing.append("rapidocr-onnxruntime")
                 if not _HAS_TESSERACT: missing.append("tesseract")
-                if missing:
-                    logger.warning("  no OCR engine produced output. Missing: %s",
-                                   ", ".join(missing))
+                logger.warning("  no OCR engine produced output. Missing: %s",
+                               ", ".join(missing) if missing else "(all engines failed)")
+        else:
+            logger.info("--- Page %d (chars=%d) ---", r.page_num, r.char_count)
+            candidates = [(r.score, "pdfplumber", r.tables, r.title_lines)]
+            logger.info("  pdfplumber: %d tables, score=%.2f",
+                        len(r.tables), r.score)
+            if r.page_num in lattice:
+                ts = lattice[r.page_num]
+                sc = sum(_score_table(t) for t in ts)
+                candidates.append((sc, "camelot-lattice", ts, []))
+                logger.info("  camelot/lattice: %d tables, score=%.2f", len(ts), sc)
+            if r.page_num in stream:
+                ts = stream[r.page_num]
+                sc = sum(_score_table(t) for t in ts)
+                candidates.append((sc, "camelot-stream", ts, []))
+                logger.info("  camelot/stream:  %d tables, score=%.2f", len(ts), sc)
+
+            # Auto-route to OCR when native is weak/empty
+            best_native = max((c[0] for c in candidates), default=0.0)
+            is_scanned = r.char_count < 5
+            weak_native = best_native < 1.0 and sum(len(c[2]) for c in candidates) == 0
+            if is_scanned or weak_native:
+                why = "no text layer" if is_scanned else "native extractors empty"
+                logger.info("  → OCR routing (%s)", why)
+                candidates.extend(_run_ocr_candidates(pdf_path, r.page_num))
+
+                if all(c[1] in ("pdfplumber", "camelot-lattice", "camelot-stream")
+                       for c in candidates):
+                    missing = []
+                    if not _HAS_PADDLE: missing.append("paddleocr")
+                    if not _HAS_RAPIDOCR: missing.append("rapidocr-onnxruntime")
+                    if not _HAS_TESSERACT: missing.append("tesseract")
+                    if missing:
+                        logger.warning("  no OCR engine produced output. Missing: %s",
+                                       ", ".join(missing))
 
         score, method, tables, titles = max(candidates, key=lambda c: c[0]) \
             if candidates else (0.0, "none", [], [])
-        logger.info("  CHOSEN: %s (score %.2f, %d table%s)",
-                    method, score, len(tables), "" if len(tables) == 1 else "s")
+        logger.info("  CHOSEN: %s (score %.2f, %d table%s)%s",
+                    method, score, len(tables), "" if len(tables) == 1 else "s",
+                    " [FORCE OCR]" if force_ocr else "")
         chosen.append(PageResult(
             page_num=r.page_num, tables=tables, title_lines=titles,
             method=method, score=score, char_count=r.char_count,
@@ -1343,8 +1372,13 @@ def convert_pdf_bytes_to_xlsx_bytes(pdf_bytes: bytes,
 
 def convert_pdf_bytes(pdf_bytes: bytes,
                       pages: Optional[set[int]] = None,
-                      filename: str = "") -> ConvertResult:
-    """Run the full pipeline and return ConvertResult: xlsx + log + preview."""
+                      filename: str = "",
+                      force_ocr: bool = False) -> ConvertResult:
+    """Run the full pipeline and return ConvertResult: xlsx + log + preview.
+
+    When ``force_ocr`` is True, the PDF's text layer (and Camelot, which also
+    relies on it) is bypassed and every selected page is re-read with OCR.
+    Useful for PDFs whose text layer is corrupted ``(cid:N)`` glyph codes."""
     # Capture every log message emitted from this module during the run.
     log_buf = io.StringIO()
     handler = logging.StreamHandler(log_buf)
@@ -1356,16 +1390,19 @@ def convert_pdf_bytes(pdf_bytes: bytes,
     logger.addHandler(handler)
 
     log_buf.write(_engine_availability_block())
-    logger.info("Input: %s (%d bytes)%s",
+    logger.info("Input: %s (%d bytes)%s%s",
                 filename or "<unnamed>", len(pdf_bytes),
-                f", pages filter: {sorted(pages)}" if pages else "")
+                f", pages filter: {sorted(pages)}" if pages else "",
+                " — FORCE OCR enabled" if force_ocr else "")
 
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
             f.write(pdf_bytes)
             tmp_path = f.name
         try:
-            wb, page_results = _convert_pdf_to_workbook_full(tmp_path, pages=pages)
+            wb, page_results = _convert_pdf_to_workbook_full(
+                tmp_path, pages=pages, force_ocr=force_ocr,
+            )
             buf = io.BytesIO()
             wb.save(buf)
             xlsx_bytes = buf.getvalue()
@@ -1383,10 +1420,10 @@ def convert_pdf_bytes(pdf_bytes: bytes,
          "tables": len(p.tables), "chars": p.char_count}
         for p in page_results
     ]
-    ocr_used = any(p.method.endswith("ocr") for p in page_results)
+    ocr_used = force_ocr or any(p.method.endswith("ocr") for p in page_results)
     ocr_engine = next(
         (p.method for p in page_results if p.method.endswith("ocr")),
-        "",
+        ("forced-ocr-no-engine" if force_ocr else ""),
     )
     preview_html = None
     if ocr_used:
