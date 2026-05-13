@@ -61,9 +61,8 @@ const downloadLink = document.getElementById("downloadLink");
 const againBtn = document.getElementById("againBtn");
 const engineBadgeRow = document.getElementById("engineBadgeRow");
 const engineBadge = document.getElementById("engineBadge");
-const ocrPreviewWrap = document.getElementById("ocrPreviewWrap");
-const ocrPreviewFrame = document.getElementById("ocrPreviewFrame");
-const discardBtn = document.getElementById("discardBtn");
+const previewBtn = document.getElementById("previewBtn");
+const logDlBtn = document.getElementById("logDlBtn");
 
 const splitResultEl = document.getElementById("splitResult");
 const splitListEl = document.getElementById("splitList");
@@ -378,54 +377,53 @@ function runConvert(file, pageSpec) {
     statusMsg.textContent = "The boss is crunching the numbers…";
     progressBar.classList.add("indeterminate");
   };
-  xhr.onload = async () => {
+  xhr.onload = () => {
     progressBar.classList.remove("indeterminate");
     progressBar.style.width = "100%";
     if (xhr.status === 200) {
-      const zipBlob = xhr.response;
+      const xlsxBlob = xhr.response;
       const ocrUsed = (xhr.getResponseHeader("X-Boss-OCR-Used") || "") === "true";
       const ocrEngine = xhr.getResponseHeader("X-Boss-OCR-Engine") || "";
-      const stem = file.name.replace(/\.pdf$/i, "");
-      const outName = `${stem}.zip`;
+      const logId = xhr.getResponseHeader("X-Boss-Log-Id") || "";
 
-      const url = URL.createObjectURL(zipBlob);
+      const stem = file.name.replace(/\.pdf$/i, "");
+      const outName = `${stem}.xlsx`;
+      const url = URL.createObjectURL(xlsxBlob);
       downloadLink.href = url;
       downloadLink.download = outName;
-      resultMsg.textContent = pageSpec === "all"
-        ? "Whole document converted. Verify the preview, then save."
-        : `Converted pages ${pageSpec}. Verify the preview, then save.`;
 
       // engine badge
       engineBadge.classList.remove("native", "ocr");
       if (ocrUsed) {
-        engineBadge.textContent = ocrEngine.replace(/-/g, " ");
+        engineBadge.textContent = ocrEngine.replace(/-/g, " ") || "OCR";
         engineBadge.classList.add("ocr");
-        discardBtn.classList.remove("hidden");
+        resultMsg.textContent = `OCR ran via ${ocrEngine.replace(/-/g, ' ')}. Open the preview to verify text quality.`;
       } else {
         engineBadge.textContent = "native text";
         engineBadge.classList.add("native");
-        discardBtn.classList.add("hidden");
+        resultMsg.textContent = "Native text extraction — clean.";
       }
       engineBadgeRow.classList.remove("hidden");
 
-      // inline OCR preview (only when OCR ran)
-      ocrPreviewWrap.classList.add("hidden");
-      ocrPreviewFrame.removeAttribute("src");
-      if (ocrUsed) {
-        try {
-          const previewHtml = await extractFromZip(zipBlob, "ocr-preview.html");
-          if (previewHtml) {
-            const blob = new Blob([previewHtml], { type: "text/html" });
-            ocrPreviewFrame.src = URL.createObjectURL(blob);
-            ocrPreviewWrap.classList.remove("hidden");
-          }
-        } catch (e) {
-          console.warn("preview extract failed:", e);
-        }
+      // log button (always available)
+      if (logId) {
+        logDlBtn.href = `/api/log/${logId}`;
+        logDlBtn.classList.remove("hidden");
+      } else {
+        logDlBtn.classList.add("hidden");
+      }
+
+      // OCR preview button (only when OCR ran)
+      if (ocrUsed && logId) {
+        previewBtn.href = `/api/preview/${logId}`;
+        previewBtn.classList.remove("hidden");
+      } else {
+        previewBtn.removeAttribute("href");
+        previewBtn.classList.add("hidden");
       }
 
       showOnly(resultEl);
-      // Don't auto-trigger download — let user verify preview first.
+      downloadLink.click(); // auto-download xlsx
     } else {
       const reader = new FileReader();
       reader.onload = () => {
@@ -706,68 +704,3 @@ async function reuploadAndConvert(file) {
 againBtn.addEventListener("click", resetAll);
 splitAgainBtn.addEventListener("click", resetAll);
 retryBtn.addEventListener("click", resetAll);
-discardBtn.addEventListener("click", () => {
-  // OCR looked bad. Throw away the result blob, send user back to the chooser.
-  if (downloadLink.href && downloadLink.href.startsWith("blob:")) {
-    URL.revokeObjectURL(downloadLink.href);
-  }
-  showChooser();
-});
-
-// ---------- Tiny ZIP reader (central-directory + DecompressionStream) ----------
-// Reads one named entry out of a zip blob. Returns the entry's text content,
-// or null if not found. Supports DEFLATE (method 8) and STORED (method 0).
-async function extractFromZip(zipBlob, name) {
-  const buf = await zipBlob.arrayBuffer();
-  const dv = new DataView(buf);
-
-  // Find End of Central Directory (EOCD) signature 0x06054b50, scan from end.
-  const maxScan = Math.min(buf.byteLength, 65557); // EOCD+max-comment
-  let eocdOffset = -1;
-  for (let i = buf.byteLength - 22; i >= buf.byteLength - maxScan; i--) {
-    if (i < 0) break;
-    if (dv.getUint32(i, true) === 0x06054b50) { eocdOffset = i; break; }
-  }
-  if (eocdOffset < 0) throw new Error("EOCD not found");
-
-  const cdEntries = dv.getUint16(eocdOffset + 10, true);
-  const cdSize = dv.getUint32(eocdOffset + 12, true);
-  const cdOffset = dv.getUint32(eocdOffset + 16, true);
-
-  const decoder = new TextDecoder("utf-8");
-  let p = cdOffset;
-  for (let i = 0; i < cdEntries; i++) {
-    if (dv.getUint32(p, true) !== 0x02014b50) throw new Error("bad CD entry");
-    const method = dv.getUint16(p + 10, true);
-    const compSize = dv.getUint32(p + 20, true);
-    const uncompSize = dv.getUint32(p + 24, true);
-    const nameLen = dv.getUint16(p + 28, true);
-    const extraLen = dv.getUint16(p + 30, true);
-    const commentLen = dv.getUint16(p + 32, true);
-    const localHdr = dv.getUint32(p + 42, true);
-    const entryName = decoder.decode(new Uint8Array(buf, p + 46, nameLen));
-    p += 46 + nameLen + extraLen + commentLen;
-
-    if (entryName !== name) continue;
-
-    // Walk into the local file header to find where data starts
-    if (dv.getUint32(localHdr, true) !== 0x04034b50) throw new Error("bad LFH");
-    const lhNameLen = dv.getUint16(localHdr + 26, true);
-    const lhExtraLen = dv.getUint16(localHdr + 28, true);
-    const dataOffset = localHdr + 30 + lhNameLen + lhExtraLen;
-    const compData = new Uint8Array(buf, dataOffset, compSize);
-
-    if (method === 0) {
-      return decoder.decode(compData);
-    }
-    if (method === 8) {
-      // raw deflate — use DecompressionStream
-      const ds = new DecompressionStream("deflate-raw");
-      const stream = new Blob([compData]).stream().pipeThrough(ds);
-      const out = await new Response(stream).arrayBuffer();
-      return decoder.decode(new Uint8Array(out, 0, Math.min(out.byteLength, uncompSize)));
-    }
-    throw new Error("unsupported compression method " + method);
-  }
-  return null;
-}

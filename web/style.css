@@ -931,13 +931,3 @@ footer {
   color: var(--ok);
 }
 
-.ocr-preview-frame {
-  display: block;
-  width: 100%;
-  height: 460px;
-  background: var(--bg-warm);
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  margin-top: 8px;
-  margin-bottom: 16px;
-}

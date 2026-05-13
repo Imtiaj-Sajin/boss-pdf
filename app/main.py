@@ -5,12 +5,15 @@ import io
 import json
 import logging
 import os
+import threading
+import time
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pypdf import PdfReader, PdfWriter
 
@@ -25,6 +28,37 @@ WEB = ROOT / "web"
 app = FastAPI(title="boss-pdf", description="The Boss of all PDFs.")
 
 MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+
+# In-memory cache for per-conversion diagnostics (log + OCR preview HTML).
+# Keyed by a random log_id; expires after _RESULT_TTL seconds.
+_RESULT_TTL = 3600  # 1 hour
+_results_lock = threading.Lock()
+_results_cache: dict[str, dict] = {}
+
+
+def _stash_result(log_text: str, preview_html: Optional[str]) -> str:
+    log_id = uuid.uuid4().hex
+    now = time.time()
+    with _results_lock:
+        _results_cache[log_id] = {
+            "log_text": log_text,
+            "preview_html": preview_html,
+            "expires_at": now + _RESULT_TTL,
+        }
+        # opportunistic cleanup
+        for k in list(_results_cache.keys()):
+            if _results_cache[k]["expires_at"] < now:
+                del _results_cache[k]
+    return log_id
+
+
+def _get_result(log_id: str) -> Optional[dict]:
+    with _results_lock:
+        data = _results_cache.get(log_id)
+        if data and data["expires_at"] < time.time():
+            del _results_cache[log_id]
+            return None
+        return data
 
 
 def _validate_pdf(pdf_bytes: bytes) -> None:
@@ -100,31 +134,46 @@ async def convert(file: UploadFile = File(...),
         log.exception("conversion failed")
         raise HTTPException(status_code=500, detail=f"Conversion failed: {e}") from e
 
+    # Stash log + preview server-side; client fetches them from /api/log/{id}
+    # and /api/preview/{id} when the user clicks the corresponding button.
+    log_id = _stash_result(result.log_text, result.preview_html)
+
     stem = os.path.splitext(_safe_filename(file.filename))[0]
-
-    # Bundle xlsx + diagnostic log + (when OCR ran) selectable-text preview.
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(f"{stem}.xlsx", result.xlsx_bytes)
-        zf.writestr("boss-pdf-log.txt", result.log_text)
-        if result.preview_html:
-            zf.writestr("ocr-preview.html", result.preview_html)
-    zip_buf.seek(0)
-
-    out_name = f"{stem}.zip"
+    out_name = f"{stem}.xlsx"
     headers = {
         "Content-Disposition": f'attachment; filename="{out_name}"',
         "X-Boss-OCR-Used": "true" if result.ocr_used else "false",
         "X-Boss-OCR-Engine": result.ocr_engine or "",
+        "X-Boss-Log-Id": log_id,
         "X-Boss-Pages": str(len(result.pages_summary)),
         "Access-Control-Expose-Headers":
-            "X-Boss-OCR-Used, X-Boss-OCR-Engine, X-Boss-Pages",
+            "X-Boss-OCR-Used, X-Boss-OCR-Engine, X-Boss-Log-Id, X-Boss-Pages",
     }
     return StreamingResponse(
-        zip_buf,
-        media_type="application/zip",
+        io.BytesIO(result.xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers=headers,
     )
+
+
+@app.get("/api/log/{log_id}")
+def get_log(log_id: str):
+    data = _get_result(log_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Log expired or not found.")
+    return StreamingResponse(
+        io.BytesIO(data["log_text"].encode("utf-8")),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="boss-pdf-log.txt"'},
+    )
+
+
+@app.get("/api/preview/{log_id}")
+def get_preview(log_id: str):
+    data = _get_result(log_id)
+    if not data or not data["preview_html"]:
+        raise HTTPException(status_code=404, detail="Preview not found.")
+    return HTMLResponse(content=data["preview_html"])
 
 
 def _extract_pages_to_pdf(reader: PdfReader, page_indices: list[int]) -> bytes:

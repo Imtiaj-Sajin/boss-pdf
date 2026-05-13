@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;0,9..144,800;1,9..144,600;1,9..144,700;1,9..144,800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=7" />
+  <link rel="stylesheet" href="/static/style.css?v=8" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
           crossorigin="anonymous"
           referrerpolicy="no-referrer"></script>
@@ -163,18 +163,11 @@
         <span id="engineBadge" class="engine-badge">native text</span>
       </div>
 
-      <div id="ocrPreviewWrap" class="hidden">
-        <div class="preview-header">
-          <span class="preview-label">OCR preview · select text to verify</span>
-          <span class="preview-hint">if it reads cleanly, OCR worked. if it's garbled, hit "Discard".</span>
-        </div>
-        <iframe id="ocrPreviewFrame" class="ocr-preview-frame" sandbox="allow-same-origin" title="OCR preview"></iframe>
-      </div>
-
       <div class="row-actions">
-        <a id="downloadLink" class="primary" download>Save .zip (xlsx + log)</a>
+        <a id="downloadLink" class="primary" download>Download .xlsx</a>
+        <a id="previewBtn" class="ghost hidden" target="_blank" rel="noopener">Open OCR preview</a>
+        <a id="logDlBtn" class="ghost hidden" download="boss-pdf-log.txt">Download log</a>
         <button id="againBtn" class="ghost" type="button">Boss another file</button>
-        <button id="discardBtn" class="ghost hidden" type="button">Discard — OCR looks bad</button>
       </div>
     </section>
 
@@ -200,6 +193,6 @@
     <small>boss-pdf · runs locally · files never leave your machine</small>
   </footer>
 
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>
