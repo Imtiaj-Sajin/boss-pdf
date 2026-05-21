@@ -8,3 +8,12 @@ pypdf>=5.0
 Pillow>=10.4
 numpy>=1.26
 pandas>=2.2
+
+# ODIN EMS auth + usage tracking
+sqlalchemy>=2.0
+mysql-connector-python>=9.0
+python-dotenv>=1.0
+passlib[bcrypt]>=1.7.4
+python-jose[cryptography]>=3.3
+# bcrypt 5.x breaks passlib init with "password cannot be longer than 72 bytes" — pin it.
+bcrypt==4.0.1

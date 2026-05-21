@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>boss-pdf — usage</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;0,9..144,800;1,9..144,600;1,9..144,700;1,9..144,800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css?v=10" />
+  <script src="/static/auth.js?v=10"></script>
+  <script>if (!BossAuth.requireAuth()) { /* redirected */ }</script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <a href="/" style="text-decoration:none;color:inherit;display:flex;align-items:center;gap:14px;">
+        <div class="logo" aria-hidden="true">
+          <span class="logo-crown"></span>
+          <span class="logo-letter">B</span>
+        </div>
+        <div class="brand-text">
+          <span class="title">boss<span class="dot">·</span>pdf</span>
+          <span class="subtitle">
+            <span class="status-dot"></span>
+            usage ledger
+          </span>
+        </div>
+      </a>
+    </div>
+    <div class="header-right">
+      <a href="/" class="header-link">← Back to work</a>
+      <div id="userChip" class="user-chip hidden" title="Signed in">
+        <span class="user-avatar" id="userAvatar">·</span>
+        <span class="user-meta">
+          <span id="userName" class="user-name">…</span>
+          <span id="userTitle" class="user-title"></span>
+        </span>
+        <button id="logoutBtn" class="user-logout" type="button" title="Sign out">↩</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="usage-main">
+    <section class="card">
+      <p class="kicker">— Your ledger —</p>
+      <h1 class="boss-line">Time saved at a glance.</h1>
+      <p class="boss-sub" id="meSummary">Loading…</p>
+
+      <div class="stat-grid" id="meStats"></div>
+    </section>
+
+    <section class="card">
+      <div class="filebar" style="margin-bottom: 14px;">
+        <span class="memo">All hands</span>
+        <span class="fname" id="allHeader">Every job, every operator.</span>
+        <span class="fsize" id="rowCount"></span>
+      </div>
+
+      <div class="page-toolbar" style="margin-bottom: 18px;">
+        <span class="toolbar-label">Time</span>
+        <button class="ghost small" data-range="today" type="button">Today</button>
+        <button class="ghost small" data-range="week" type="button">7 days</button>
+        <button class="ghost small" data-range="month" type="button">30 days</button>
+        <button class="ghost small active" data-range="all" type="button">All time</button>
+        <span class="toolbar-divider"></span>
+        <span class="toolbar-label">Op</span>
+        <button class="ghost small active" data-op="all" type="button">All</button>
+        <button class="ghost small" data-op="convert" type="button">Excel</button>
+        <button class="ghost small" data-op="split" type="button">Split</button>
+        <span class="toolbar-divider"></span>
+        <input type="search" id="searchBox" class="range-mini" placeholder="filter user / file"
+               style="width: 200px; text-align:left;" />
+      </div>
+
+      <div id="usersList" class="users-list"></div>
+    </section>
+  </main>
+
+  <footer>
+    <small>boss-pdf · usage tracked locally · everyone in ODIN EMS can view</small>
+  </footer>
+
+  <script src="/static/usage.js?v=10"></script>
+</body>
+</html>

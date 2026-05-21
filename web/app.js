@@ -7,6 +7,44 @@ if (window.pdfjsLib) {
     "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 }
 
+// ---------- User chip in header ----------
+(async function initUserChip() {
+  const chip = document.getElementById("userChip");
+  const nameEl = document.getElementById("userName");
+  const titleEl = document.getElementById("userTitle");
+  const avatarEl = document.getElementById("userAvatar");
+  const logoutBtn = document.getElementById("logoutBtn");
+  if (!chip) return;
+
+  // Instant display from JWT, then enrich from /auth/me.
+  const quick = BossAuth.quickUser();
+  if (quick) {
+    nameEl.textContent = quick.username;
+    avatarEl.textContent = (quick.username[0] || "?").toUpperCase();
+    chip.classList.remove("hidden");
+  }
+  logoutBtn.addEventListener("click", () => BossAuth.logout());
+  try {
+    const me = await BossAuth.me();
+    if (me.full_name) nameEl.textContent = me.full_name;
+    if (me.designation) titleEl.textContent = me.designation;
+    if (me.profile_photo_url) {
+      avatarEl.innerHTML = "";
+      const img = document.createElement("img");
+      img.src = me.profile_photo_url;
+      img.alt = "";
+      avatarEl.appendChild(img);
+    } else {
+      avatarEl.textContent = ((me.full_name || me.username || "?")[0]).toUpperCase();
+    }
+    chip.classList.remove("hidden");
+  } catch (_) { /* token invalid — authFetch already redirected */ }
+})();
+
+// Track the last usage row id so we can bump downloads on user click.
+let lastConvertUsageId = null;
+let lastSplitUsageIds = []; // parallel to split results
+
 const SECTION_COLORS = [
   "#c9a15a", // gold
   "#5fdfb0", // mint
@@ -174,7 +212,7 @@ async function handleFile(file) {
   try {
     const form = new FormData();
     form.append("file", file);
-    const res = await fetch("/api/pdf-info", { method: "POST", body: form });
+    const res = await BossAuth.authFetch("/api/pdf-info", { method: "POST", body: form });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
       throw new Error(j.detail || "Could not read PDF.");
@@ -373,6 +411,7 @@ function runConvert(file, pageSpec, forceOcr) {
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/api/convert");
   xhr.responseType = "blob";
+  BossAuth.applyAuthHeaders(xhr);
 
   xhr.upload.onprogress = e => {
     if (e.lengthComputable) {
@@ -392,6 +431,8 @@ function runConvert(file, pageSpec, forceOcr) {
       const ocrUsed = (xhr.getResponseHeader("X-Boss-OCR-Used") || "") === "true";
       const ocrEngine = xhr.getResponseHeader("X-Boss-OCR-Engine") || "";
       const logId = xhr.getResponseHeader("X-Boss-Log-Id") || "";
+      const usageId = xhr.getResponseHeader("X-Boss-Usage-Id") || "";
+      lastConvertUsageId = usageId ? parseInt(usageId, 10) : null;
 
       const stem = file.name.replace(/\.pdf$/i, "");
       const outName = `${stem}.xlsx`;
@@ -412,9 +453,9 @@ function runConvert(file, pageSpec, forceOcr) {
       }
       engineBadgeRow.classList.remove("hidden");
 
-      // log button (always available)
+      // log button (always available) — fetched with auth, then opened as blob URL
       if (logId) {
-        logDlBtn.href = `/api/log/${logId}`;
+        logDlBtn.dataset.logId = logId;
         logDlBtn.classList.remove("hidden");
       } else {
         logDlBtn.classList.add("hidden");
@@ -422,10 +463,10 @@ function runConvert(file, pageSpec, forceOcr) {
 
       // OCR preview button (only when OCR ran)
       if (ocrUsed && logId) {
-        previewBtn.href = `/api/preview/${logId}`;
+        previewBtn.dataset.logId = logId;
         previewBtn.classList.remove("hidden");
       } else {
-        previewBtn.removeAttribute("href");
+        delete previewBtn.dataset.logId;
         previewBtn.classList.add("hidden");
       }
 
@@ -635,12 +676,14 @@ function splitOne(file, spec) {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/split");
     xhr.responseType = "blob";
+    BossAuth.applyAuthHeaders(xhr);
     xhr.onload = () => {
       if (xhr.status === 200) {
+        const usageId = xhr.getResponseHeader("X-Boss-Usage-Id") || "";
         const stem = file.name.replace(/\.pdf$/i, "");
         const safeSpec = spec.replace(/,/g, "_");
         const name = `${stem}_p${safeSpec}.pdf`;
-        resolve({ spec, blob: xhr.response, name });
+        resolve({ spec, blob: xhr.response, name, usageId: usageId ? parseInt(usageId, 10) : null });
       } else {
         const reader = new FileReader();
         reader.onload = () => {
@@ -673,6 +716,12 @@ function renderSplitResults(originalFile, results) {
         <button class="toxlsx" type="button">📊 Make it Excel</button>
       </div>
     `;
+    item.querySelector(".dl").addEventListener("click", () => {
+      if (r.usageId) {
+        BossAuth.authFetch(`/api/usage/${r.usageId}/download?kind=split`,
+                           { method: "POST" }).catch(() => {});
+      }
+    });
     item.querySelector(".toxlsx").addEventListener("click", () => {
       const f = new File([r.blob], r.name, { type: "application/pdf" });
       currentFile = f;
@@ -694,7 +743,7 @@ async function reuploadAndConvert(file) {
   try {
     const form = new FormData();
     form.append("file", file);
-    const res = await fetch("/api/pdf-info", { method: "POST", body: form });
+    const res = await BossAuth.authFetch("/api/pdf-info", { method: "POST", body: form });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
       throw new Error(j.detail || "Could not read PDF.");
@@ -706,6 +755,42 @@ async function reuploadAndConvert(file) {
     showError(err.message || String(err));
   }
 }
+
+// ---------- Auth-aware log + preview buttons ----------
+async function fetchBlobAuthed(url) {
+  const res = await BossAuth.authFetch(url);
+  if (!res.ok) {
+    const j = await res.json().catch(() => ({}));
+    throw new Error(j.detail || `Request failed (${res.status})`);
+  }
+  return await res.blob();
+}
+
+logDlBtn.addEventListener("click", async (e) => {
+  e.preventDefault();
+  const id = logDlBtn.dataset.logId;
+  if (!id) return;
+  try {
+    const blob = await fetchBlobAuthed(`/api/log/${id}`);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "boss-pdf-log.txt";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } catch (err) { showError(err.message || String(err)); }
+});
+
+previewBtn.addEventListener("click", async (e) => {
+  e.preventDefault();
+  const id = previewBtn.dataset.logId;
+  if (!id) return;
+  try {
+    const blob = await fetchBlobAuthed(`/api/preview/${id}`);
+    const url = URL.createObjectURL(blob);
+    window.open(url, "_blank", "noopener");
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  } catch (err) { showError(err.message || String(err)); }
+});
 
 // ---------- Reset ----------
 againBtn.addEventListener("click", resetAll);

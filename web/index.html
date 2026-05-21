@@ -7,10 +7,12 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;0,9..144,800;1,9..144,600;1,9..144,700;1,9..144,800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=9" />
+  <link rel="stylesheet" href="/static/style.css?v=10" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
           crossorigin="anonymous"
           referrerpolicy="no-referrer"></script>
+  <script src="/static/auth.js?v=10"></script>
+  <script>if (!BossAuth.requireAuth()) { /* redirected */ }</script>
 </head>
 <body>
   <header class="topbar">
@@ -28,7 +30,15 @@
       </div>
     </div>
     <div class="header-right">
-      <span class="header-tag">Files stay on your machine, kid.</span>
+      <a href="/usage" class="header-link">Usage</a>
+      <div id="userChip" class="user-chip hidden" title="Signed in">
+        <span class="user-avatar" id="userAvatar">·</span>
+        <span class="user-meta">
+          <span id="userName" class="user-name">…</span>
+          <span id="userTitle" class="user-title"></span>
+        </span>
+        <button id="logoutBtn" class="user-logout" type="button" title="Sign out">↩</button>
+      </div>
     </div>
   </header>
 
@@ -205,6 +215,6 @@
     <small>boss-pdf · runs locally · files never leave your machine</small>
   </footer>
 
-  <script src="/static/app.js?v=9"></script>
+  <script src="/static/app.js?v=10"></script>
 </body>
 </html>

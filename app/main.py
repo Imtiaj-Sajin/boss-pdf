@@ -9,15 +9,22 @@ import threading
 import time
 import uuid
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pypdf import PdfReader, PdfWriter
+from sqlalchemy.orm import Session
 
+from . import usage as usage_mod
+from .auth import CurrentUser, get_current_user, router as auth_router
 from .converter import convert_pdf_bytes, parse_page_spec
+from .db import get_db
+from .usage import router as usage_router
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("boss-pdf")
@@ -26,6 +33,31 @@ ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
 
 app = FastAPI(title="boss-pdf", description="The Boss of all PDFs.")
+
+# CORS — the spec calls for allow_origins=["*"]. Tokens travel in Authorization
+# header (not cookies) so this is safe.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=[
+        "X-Boss-OCR-Used",
+        "X-Boss-OCR-Engine",
+        "X-Boss-Log-Id",
+        "X-Boss-Pages",
+        "X-Boss-Usage-Id",
+    ],
+)
+
+app.include_router(auth_router, prefix="/api")
+app.include_router(usage_router, prefix="/api")
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    usage_mod.ensure_table()
+
 
 MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 
@@ -36,13 +68,15 @@ _results_lock = threading.Lock()
 _results_cache: dict[str, dict] = {}
 
 
-def _stash_result(log_text: str, preview_html: Optional[str]) -> str:
+def _stash_result(log_text: str, preview_html: Optional[str],
+                  usage_id: Optional[int]) -> str:
     log_id = uuid.uuid4().hex
     now = time.time()
     with _results_lock:
         _results_cache[log_id] = {
             "log_text": log_text,
             "preview_html": preview_html,
+            "usage_id": usage_id,
             "expires_at": now + _RESULT_TTL,
         }
         # opportunistic cleanup
@@ -82,7 +116,8 @@ def health() -> dict:
 
 
 @app.post("/api/pdf-info")
-async def pdf_info(file: UploadFile = File(...)) -> dict:
+async def pdf_info(file: UploadFile = File(...),
+                   _: CurrentUser = Depends(get_current_user)) -> dict:
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a .pdf file.")
     pdf_bytes = await file.read()
@@ -107,9 +142,14 @@ async def pdf_info(file: UploadFile = File(...)) -> dict:
 @app.post("/api/convert")
 async def convert(file: UploadFile = File(...),
                   pages: Optional[str] = Form(None),
-                  force_ocr: Optional[str] = Form(None)):
+                  force_ocr: Optional[str] = Form(None),
+                  x_session_id: Optional[str] = Header(None),
+                  current_user: CurrentUser = Depends(get_current_user),
+                  db: Session = Depends(get_db)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a .pdf file.")
+
+    uploaded_at = datetime.now(timezone.utc)
 
     pdf_bytes = await file.read()
     _validate_pdf(pdf_bytes)
@@ -130,9 +170,9 @@ async def convert(file: UploadFile = File(...),
 
     force_flag = (force_ocr or "").lower() in ("true", "1", "yes", "on")
 
-    log.info("converting %s (%d bytes) pages=%s%s",
+    log.info("converting %s (%d bytes) pages=%s%s user=%s",
              file.filename, len(pdf_bytes), pages or "all",
-             " FORCE_OCR" if force_flag else "")
+             " FORCE_OCR" if force_flag else "", current_user.username)
     try:
         result = convert_pdf_bytes(
             pdf_bytes, pages=page_set,
@@ -142,9 +182,39 @@ async def convert(file: UploadFile = File(...),
         log.exception("conversion failed")
         raise HTTPException(status_code=500, detail=f"Conversion failed: {e}") from e
 
+    finished_at = datetime.now(timezone.utc)
+
+    pages_processed = len(result.pages_summary)
+    tables_extracted = sum(int(p.get("tables") or 0) for p in result.pages_summary)
+
+    usage_id = usage_mod.log_usage(
+        db,
+        user=current_user,
+        session_id=x_session_id,
+        operation="convert",
+        batch_name=file.filename,
+        file_names=[file.filename],
+        files_processed=1,
+        pages_processed=pages_processed,
+        tables_extracted=tables_extracted,
+        ocr_used=bool(result.ocr_used),
+        ocr_engine=result.ocr_engine or None,
+        uploaded_at=uploaded_at,
+        finished_at=finished_at,
+    )
+
+    # The xlsx is auto-downloaded by the browser on response — count it as 1.
+    # Route the bump to ocr_downloads vs downloads so the dashboard can split
+    # "native-text load" from "OCR load" without re-deriving from ocr_used.
+    if usage_id:
+        usage_mod.bump_download(
+            db, usage_id, current_user.id,
+            kind="ocr" if result.ocr_used else "download",
+        )
+
     # Stash log + preview server-side; client fetches them from /api/log/{id}
     # and /api/preview/{id} when the user clicks the corresponding button.
-    log_id = _stash_result(result.log_text, result.preview_html)
+    log_id = _stash_result(result.log_text, result.preview_html, usage_id)
 
     stem = os.path.splitext(_safe_filename(file.filename))[0]
     out_name = f"{stem}.xlsx"
@@ -153,9 +223,8 @@ async def convert(file: UploadFile = File(...),
         "X-Boss-OCR-Used": "true" if result.ocr_used else "false",
         "X-Boss-OCR-Engine": result.ocr_engine or "",
         "X-Boss-Log-Id": log_id,
-        "X-Boss-Pages": str(len(result.pages_summary)),
-        "Access-Control-Expose-Headers":
-            "X-Boss-OCR-Used, X-Boss-OCR-Engine, X-Boss-Log-Id, X-Boss-Pages",
+        "X-Boss-Pages": str(pages_processed),
+        "X-Boss-Usage-Id": str(usage_id) if usage_id else "",
     }
     return StreamingResponse(
         io.BytesIO(result.xlsx_bytes),
@@ -165,7 +234,7 @@ async def convert(file: UploadFile = File(...),
 
 
 @app.get("/api/log/{log_id}")
-def get_log(log_id: str):
+def get_log(log_id: str, _: CurrentUser = Depends(get_current_user)):
     data = _get_result(log_id)
     if not data:
         raise HTTPException(status_code=404, detail="Log expired or not found.")
@@ -177,7 +246,7 @@ def get_log(log_id: str):
 
 
 @app.get("/api/preview/{log_id}")
-def get_preview(log_id: str):
+def get_preview(log_id: str, _: CurrentUser = Depends(get_current_user)):
     data = _get_result(log_id)
     if not data or not data["preview_html"]:
         raise HTTPException(status_code=404, detail="Preview not found.")
@@ -195,7 +264,10 @@ def _extract_pages_to_pdf(reader: PdfReader, page_indices: list[int]) -> bytes:
 
 @app.post("/api/split")
 async def split(file: UploadFile = File(...),
-                ranges: str = Form(...)):
+                ranges: str = Form(...),
+                x_session_id: Optional[str] = Header(None),
+                current_user: CurrentUser = Depends(get_current_user),
+                db: Session = Depends(get_db)):
     """Split a PDF into one or more output PDFs.
 
     `ranges` is a JSON array of strings, each a page-spec like "1-3" or "5".
@@ -203,6 +275,8 @@ async def split(file: UploadFile = File(...),
     """
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a .pdf file.")
+
+    uploaded_at = datetime.now(timezone.utc)
 
     pdf_bytes = await file.read()
     _validate_pdf(pdf_bytes)
@@ -240,12 +314,30 @@ async def split(file: UploadFile = File(...),
         parsed.append((spec, idx))
 
     stem = os.path.splitext(_safe_filename(file.filename))[0]
+    pages_processed = sum(len(idx) for _, idx in parsed)
 
     if len(parsed) == 1:
         spec, idx = parsed[0]
         out = _extract_pages_to_pdf(reader, idx)
+        finished_at = datetime.now(timezone.utc)
+        usage_id = usage_mod.log_usage(
+            db,
+            user=current_user,
+            session_id=x_session_id,
+            operation="split",
+            batch_name=file.filename,
+            file_names=[file.filename],
+            files_processed=1,
+            pages_processed=pages_processed,
+            split_parts=1,
+            uploaded_at=uploaded_at,
+            finished_at=finished_at,
+        )
         out_name = f"{stem}_p{spec.replace(',', '_')}.pdf"
-        headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+        headers = {
+            "Content-Disposition": f'attachment; filename="{out_name}"',
+            "X-Boss-Usage-Id": str(usage_id) if usage_id else "",
+        }
         return StreamingResponse(io.BytesIO(out), media_type="application/pdf", headers=headers)
 
     # Multiple ranges -> zip them up
@@ -256,8 +348,25 @@ async def split(file: UploadFile = File(...),
             label = spec.replace(",", "_")
             zf.writestr(f"{stem}_part{i}_p{label}.pdf", part)
     zip_buf.seek(0)
+    finished_at = datetime.now(timezone.utc)
+    usage_id = usage_mod.log_usage(
+        db,
+        user=current_user,
+        session_id=x_session_id,
+        operation="split",
+        batch_name=file.filename,
+        file_names=[file.filename],
+        files_processed=1,
+        pages_processed=pages_processed,
+        split_parts=len(parsed),
+        uploaded_at=uploaded_at,
+        finished_at=finished_at,
+    )
     out_name = f"{stem}_split.zip"
-    headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+    headers = {
+        "Content-Disposition": f'attachment; filename="{out_name}"',
+        "X-Boss-Usage-Id": str(usage_id) if usage_id else "",
+    }
     return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
 
 
@@ -268,3 +377,11 @@ if WEB.exists():
     @app.get("/")
     def index() -> FileResponse:
         return FileResponse(str(WEB / "index.html"))
+
+    @app.get("/login")
+    def login_page() -> FileResponse:
+        return FileResponse(str(WEB / "login.html"))
+
+    @app.get("/usage")
+    def usage_page() -> FileResponse:
+        return FileResponse(str(WEB / "usage.html"))

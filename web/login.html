@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>boss-pdf — sign in</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;0,9..144,800;1,9..144,600;1,9..144,700;1,9..144,800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css?v=10" />
+</head>
+<body class="login-body">
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <span class="logo-crown"></span>
+        <span class="logo-letter">B</span>
+      </div>
+      <div class="brand-text">
+        <span class="title">boss<span class="dot">·</span>pdf</span>
+        <span class="subtitle">
+          <span class="status-dot"></span>
+          The boss is in.
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <main class="login-wrap">
+    <section class="card login-card">
+      <p class="kicker">— Identify yourself —</p>
+      <h1 class="boss-line">Sign in to see the boss.</h1>
+      <p class="boss-sub">Use your ODIN EMS credentials.</p>
+
+      <form id="loginForm" autocomplete="on">
+        <label class="field">
+          <span class="field-label">Username or email</span>
+          <input id="username" name="username" type="text" autocomplete="username" required />
+        </label>
+        <label class="field">
+          <span class="field-label">Password</span>
+          <input id="password" name="password" type="password" autocomplete="current-password" required />
+        </label>
+        <div id="loginErr" class="login-err hidden"></div>
+        <div class="row-actions">
+          <button id="submitBtn" class="primary" type="submit">Sign in</button>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <footer>
+    <small>boss-pdf · authenticated via ODIN EMS</small>
+  </footer>
+
+  <script src="/static/auth.js?v=10"></script>
+  <script src="/static/login.js?v=10"></script>
+</body>
+</html>
