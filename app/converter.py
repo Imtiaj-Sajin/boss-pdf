@@ -1204,6 +1204,61 @@ def _write_rich_table(ws, table: RichTable, start_row: int, n_cols: int) -> int:
     return start_row + len(table) + 1  # spacer row
 
 
+_BANNER_FILL = PatternFill(start_color="FF1F4E79", end_color="FF1F4E79", fill_type="solid")
+_BLANK_ROWS_BETWEEN_PAGES = 2
+
+
+def _write_page_banner(ws, page_num: int, n_cols: int, row: int) -> int:
+    """Write a single 'Page N' label row spanning n_cols. Returns next row."""
+    cell = ws.cell(row=row, column=1, value=f"Page {page_num}")
+    cell.font = Font(bold=True, size=13, color="FFFFFFFF")
+    cell.fill = _BANNER_FILL
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    cell.border = _BORDER
+    if n_cols > 1:
+        ws.merge_cells(start_row=row, start_column=1,
+                       end_row=row, end_column=n_cols)
+        # apply border to merged cells too so the banner looks solid
+        for c in range(2, n_cols + 1):
+            ws.cell(row=row, column=c).border = _BORDER
+    ws.row_dimensions[row].height = 22
+    return row + 1
+
+
+def _build_combined_sheet(wb: Workbook, pages: list[PageResult]) -> None:
+    """Build an 'All pages' sheet stacking every page vertically with a banner
+    + blank-row separator between pages. So the user gets one ready-to-work
+    sheet without having to merge per-page tabs by hand."""
+    pages_with_tables = [p for p in pages if p.tables]
+    if not pages_with_tables:
+        return
+
+    # Pick a consistent column count across the whole sheet — the widest table wins
+    n_cols = max(
+        (len(t[0]) for p in pages_with_tables for t in p.tables if t),
+        default=1,
+    )
+
+    ws = wb.create_sheet(title="All pages")
+
+    next_row = 1
+    for i, page in enumerate(pages_with_tables):
+        next_row = _write_page_banner(ws, page.page_num, n_cols, next_row)
+        if page.title_lines:
+            next_row = _write_title_rows(ws, page.title_lines, n_cols, next_row)
+        for t in page.tables:
+            next_row = _write_rich_table(ws, t, start_row=next_row, n_cols=n_cols)
+        if i < len(pages_with_tables) - 1:
+            next_row += _BLANK_ROWS_BETWEEN_PAGES
+
+    # Freeze the top banner so the user always knows which page they're looking at
+    ws.freeze_panes = "A2"
+    _autosize(ws, n_cols)
+
+    # Move it to the front so it opens first
+    wb.move_sheet(ws, offset=-len(wb.sheetnames) + 1)
+
+
 def _build_workbook(pages: list[PageResult]) -> Workbook:
     wb = Workbook()
     wb.remove(wb.active)
@@ -1229,6 +1284,8 @@ def _build_workbook(pages: list[PageResult]) -> Workbook:
         ws.freeze_panes = f"A{freeze_row}"
 
         _autosize(ws, n_cols)
+
+    _build_combined_sheet(wb, pages)
 
     if not any_content:
         ws = wb.create_sheet(title="No tables found")
