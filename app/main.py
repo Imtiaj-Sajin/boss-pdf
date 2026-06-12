@@ -59,7 +59,7 @@ def _on_startup() -> None:
     usage_mod.ensure_table()
 
 
-MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+MAX_BYTES = 500 * 1024 * 1024  # 500 MB
 
 # In-memory cache for per-conversion diagnostics (log + OCR preview HTML).
 # Keyed by a random log_id; expires after _RESULT_TTL seconds.

@@ -86,6 +86,15 @@ const splitSummary = document.getElementById("splitSummary");
 const splitThumbs = document.getElementById("splitThumbs");
 const splitBtn = document.getElementById("splitBtn");
 const splitBack = document.getElementById("splitBack");
+const splitModeBtns = document.querySelectorAll("[data-split-mode]");
+const rangesBlock = document.getElementById("rangesBlock");
+const rangesToolbar = document.getElementById("rangesToolbar");
+const pickPanel = document.getElementById("pickPanel");
+const pickClearBtn = document.getElementById("pickClearBtn");
+const pickInputEl = document.getElementById("pickInput");
+const pickCountEl = document.getElementById("pickCount");
+const splitModeHint = document.getElementById("splitModeHint");
+const splitPreviewHint = document.getElementById("splitPreviewHint");
 
 const statusEl = document.getElementById("status");
 const fileNameEl = document.getElementById("fileName");
@@ -119,6 +128,11 @@ let pdfDocFile = null;
 const convSelected = new Set();
 let sections = []; // [{ from, to, color }]
 
+// Splitter modes: "ranges" (existing per-row inputs → many PDFs)
+// or "pick" (click thumbnails → one PDF made of the picked pages, in order).
+let splitMode = "ranges";
+const pickedPages = new Set();
+
 const ALL_CARDS = [chooserEl, converterEl, splitterEl, statusEl, resultEl, splitResultEl, errorEl];
 
 // ---------- Helpers ----------
@@ -143,6 +157,8 @@ function resetAll() {
   pdfDocFile = null;
   convSelected.clear();
   sections = [];
+  pickedPages.clear();
+  splitMode = "ranges";
   convThumbs.innerHTML = "";
   splitThumbs.innerHTML = "";
   sectionListEl.innerHTML = "";
@@ -196,8 +212,8 @@ async function handleFile(file) {
     showError("That doesn't look like a .pdf. The boss only does PDFs.");
     return;
   }
-  if (file.size > 50 * 1024 * 1024) {
-    showError("File is over 50 MB. The boss has standards.");
+  if (file.size > 500 * 1024 * 1024) {
+    showError("File is over 500 MB. The boss has standards.");
     return;
   }
   currentFile = file;
@@ -496,14 +512,103 @@ async function openSplitter() {
   splitPages.textContent = `${pageCount} page${pageCount === 1 ? "" : "s"}`;
   // default: ONE section, page 1 → last page
   sections = [{ from: 1, to: pageCount, color: SECTION_COLORS[0] }];
+  pickedPages.clear();
+  setSplitMode("ranges");
   showOnly(splitterEl);
   renderSections();
   updateSplitSummary();
+  updatePickQueue();
 
-  await renderThumbnails(currentFile, splitThumbs, null, (allTiles) => {
-    allTiles.forEach(decorateSplitTile);
-  });
+  await renderThumbnails(currentFile, splitThumbs,
+    (i, tile) => {
+      // Click-to-add only meaningful in pick mode; ranges mode ignores clicks.
+      if (splitMode !== "pick") return;
+      if (pickedPages.has(i)) pickedPages.delete(i);
+      else pickedPages.add(i);
+      decorateSplitTile(tile);
+      updatePickQueue();
+    },
+    (allTiles) => { allTiles.forEach(decorateSplitTile); },
+  );
 }
+
+function setSplitMode(mode) {
+  splitMode = mode;
+  splitModeBtns.forEach(b =>
+    b.classList.toggle("active", b.dataset.splitMode === mode));
+  const pick = mode === "pick";
+  rangesBlock.classList.toggle("hidden", pick);
+  pickPanel.classList.toggle("hidden", !pick);
+  if (splitModeHint) {
+    splitModeHint.textContent = pick
+      ? "Click pages in the preview to build one PDF — in click order, like 1, 5, 9, 12."
+      : "Set the page range for each new PDF. Add more rows for more files.";
+  }
+  if (splitPreviewHint) {
+    splitPreviewHint.textContent = pick
+      ? "click to add/remove · hover to zoom · or type pages above"
+      : "colored rings show which PDF each page goes into · hover to zoom";
+  }
+  syncSplitTiles();
+  if (pick) updatePickQueue();
+}
+
+splitModeBtns.forEach(b => b.addEventListener("click", () => setSplitMode(b.dataset.splitMode)));
+pickClearBtn.addEventListener("click", () => {
+  pickedPages.clear();
+  updatePickQueue();
+  syncSplitTiles();
+});
+
+// Parse a free-form page spec like "1, 5, 9-12" → Set<int>. Silently drops
+// out-of-range / malformed pieces so typing doesn't error mid-stroke.
+function parsePagesSpec(spec, total) {
+  const out = new Set();
+  if (!spec || !total) return out;
+  for (const raw of spec.split(/[,\s]+/)) {
+    if (!raw) continue;
+    const m = raw.match(/^(\d+)(?:-(\d+))?$/);
+    if (!m) continue;
+    const a = parseInt(m[1], 10);
+    const b = m[2] ? parseInt(m[2], 10) : a;
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    for (let i = lo; i <= hi; i++) {
+      if (i >= 1 && i <= total) out.add(i);
+    }
+  }
+  return out;
+}
+
+function updatePickQueue({ keepInputValue = false } = {}) {
+  const arr = [...pickedPages].sort((a, b) => a - b);
+  const n = arr.length;
+  pickCountEl.classList.toggle("warn", n === 0);
+  pickCountEl.textContent = n ? `${n} page${n === 1 ? "" : "s"}` : "0 pages";
+  // Don't overwrite the input while the user is mid-type; otherwise reflect
+  // the canonical compressed form (so "1,2,3,4" collapses to "1-4").
+  if (!keepInputValue && document.activeElement !== pickInputEl) {
+    pickInputEl.value = compressPages(pickedPages);
+  }
+}
+
+pickInputEl.addEventListener("input", () => {
+  const next = parsePagesSpec(pickInputEl.value, pageCount);
+  pickedPages.clear();
+  next.forEach(n => pickedPages.add(n));
+  syncSplitTiles();
+  updatePickQueue({ keepInputValue: true });
+});
+pickInputEl.addEventListener("blur", () => {
+  // Normalize on blur — "1, 2, 3, 5" becomes "1-3,5".
+  pickInputEl.value = compressPages(pickedPages);
+});
+pickInputEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    pickInputEl.blur();   // triggers normalize
+    pickInputEl.focus();
+  }
+});
 
 function renderSections() {
   // refresh colors so they always cycle in row order
@@ -575,13 +680,28 @@ function onSectionsChanged() {
 
 function decorateSplitTile(tile) {
   const i = parseInt(tile.dataset.page, 10);
-  // first section that contains the page wins for color/tag
+  let tag = tile.querySelector(".section-tag");
+
+  if (splitMode === "pick") {
+    // Single-PDF pick mode: gold ring on selected tiles, no section tag.
+    if (tag) tag.remove();
+    if (pickedPages.has(i)) {
+      tile.classList.add("selected");
+      tile.style.setProperty("--tile-color", SECTION_COLORS[0]);
+    } else {
+      tile.classList.remove("selected");
+      tile.style.removeProperty("--tile-color");
+    }
+    return;
+  }
+
+  // Ranges mode (original behavior): first section that contains the page
+  // wins for color/tag.
   let owner = -1;
   for (let s = 0; s < sections.length; s++) {
     const sec = sections[s];
     if (sec.from <= i && i <= sec.to) { owner = s; break; }
   }
-  let tag = tile.querySelector(".section-tag");
   if (owner === -1) {
     tile.classList.remove("selected");
     tile.style.removeProperty("--tile-color");
@@ -639,7 +759,18 @@ autoSplitBtn.addEventListener("click", () => {
 splitBack.addEventListener("click", showChooser);
 
 splitBtn.addEventListener("click", () => {
-  // validate
+  if (splitMode === "pick") {
+    if (!pickedPages.size) {
+      showError("Pick at least one page from the preview, kid.");
+      return;
+    }
+    const arr = [...pickedPages].sort((a, b) => a - b);
+    // One output PDF with all picked pages — e.g. "1,5,9,12".
+    runSplit(currentFile, [arr.join(",")]);
+    return;
+  }
+
+  // Ranges mode (unchanged)
   for (let i = 0; i < sections.length; i++) {
     const s = sections[i];
     if (!(s.from >= 1 && s.to >= s.from && s.to <= pageCount)) {
@@ -791,6 +922,87 @@ previewBtn.addEventListener("click", async (e) => {
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
   } catch (err) { showError(err.message || String(err)); }
 });
+
+// ============================================================
+// Hover-zoom popup for thumbnails (works in converter + splitter)
+// ============================================================
+const zoomPopup = document.getElementById("zoomPopup");
+const zoomCanvas = document.getElementById("zoomCanvas");
+const zoomLabel = document.getElementById("zoomLabel");
+const ZOOM_DELAY_MS = 220;       // hover delay before showing
+const ZOOM_MAX_W_RATIO = 0.55;   // popup max width = 55% of viewport
+const ZOOM_MAX_H_RATIO = 0.85;
+const ZOOM_CAP_SCALE   = 2.5;
+
+let zoomTile = null;
+let zoomReq  = 0;
+let zoomTimer = null;
+
+async function showZoom(tile) {
+  if (!pdfDoc) return;
+  const pageNum = parseInt(tile.dataset.page, 10);
+  if (!pageNum) return;
+  const reqId = ++zoomReq;
+  try {
+    const page = await pdfDoc.getPage(pageNum);
+    if (reqId !== zoomReq) return;
+    const baseVp = page.getViewport({ scale: 1 });
+    const maxW = window.innerWidth  * ZOOM_MAX_W_RATIO;
+    const maxH = window.innerHeight * ZOOM_MAX_H_RATIO;
+    const scale = Math.min(maxW / baseVp.width, maxH / baseVp.height, ZOOM_CAP_SCALE);
+    const vp = page.getViewport({ scale });
+    const ratio = window.devicePixelRatio || 1;
+    zoomCanvas.width  = Math.floor(vp.width  * ratio);
+    zoomCanvas.height = Math.floor(vp.height * ratio);
+    zoomCanvas.style.width  = vp.width  + "px";
+    zoomCanvas.style.height = vp.height + "px";
+    const ctx = zoomCanvas.getContext("2d");
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    if (reqId !== zoomReq) return;
+    zoomLabel.textContent = `Page ${pageNum}`;
+
+    // Position to the right of the tile; flip to the left if it would overflow.
+    const rect = tile.getBoundingClientRect();
+    const pw = vp.width + 16;   // include the 6px padding * 2 + label space
+    const ph = vp.height + 32;
+    let left = rect.right + 14;
+    if (left + pw > window.innerWidth - 8) left = rect.left - pw - 14;
+    if (left < 8) left = 8;
+    let top = rect.top + (rect.height / 2) - (ph / 2);
+    if (top + ph > window.innerHeight - 8) top = window.innerHeight - ph - 8;
+    if (top < 8) top = 8;
+    zoomPopup.style.left = left + "px";
+    zoomPopup.style.top  = top  + "px";
+    zoomPopup.classList.remove("hidden");
+  } catch (_) { /* swallow: tile may have been removed mid-render */ }
+}
+
+function hideZoom() {
+  zoomReq++;              // cancel any in-flight render
+  zoomPopup.classList.add("hidden");
+  zoomTile = null;
+}
+
+document.addEventListener("mouseover", (e) => {
+  const tile = e.target.closest && e.target.closest(".page-tile");
+  if (!tile || tile === zoomTile) return;
+  zoomTile = tile;
+  clearTimeout(zoomTimer);
+  zoomTimer = setTimeout(() => showZoom(tile), ZOOM_DELAY_MS);
+});
+document.addEventListener("mouseout", (e) => {
+  const tile = e.target.closest && e.target.closest(".page-tile");
+  if (!tile || tile !== zoomTile) return;
+  // Don't hide if the mouse just moved between the tile's own children.
+  const next = e.relatedTarget;
+  if (next && tile.contains(next)) return;
+  clearTimeout(zoomTimer);
+  hideZoom();
+});
+// Hide on scroll (thumbgrid scrolling moves the tile out from under the popup)
+document.addEventListener("scroll", hideZoom, true);
+window.addEventListener("blur", hideZoom);
 
 // ---------- Reset ----------
 againBtn.addEventListener("click", resetAll);

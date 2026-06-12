@@ -7,11 +7,11 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;0,9..144,800;1,9..144,600;1,9..144,700;1,9..144,800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=10" />
+  <link rel="stylesheet" href="/static/style.css?v=13" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
           crossorigin="anonymous"
           referrerpolicy="no-referrer"></script>
-  <script src="/static/auth.js?v=10"></script>
+  <script src="/static/auth.js?v=13"></script>
   <script>if (!BossAuth.requireAuth()) { /* redirected */ }</script>
 </head>
 <body>
@@ -56,7 +56,7 @@
           PDFs in. Spreadsheets out.
           <br>
           Or <button id="pickBtn" class="link-btn" type="button">choose a file</button>
-          &nbsp;·&nbsp; up to 50&nbsp;MB
+          &nbsp;·&nbsp; up to 500&nbsp;MB
         </p>
         <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden />
       </div>
@@ -140,21 +140,39 @@
         <span id="splitPages" class="fsize"></span>
       </div>
       <h2 class="boss-line">How should I slice it?</h2>
-      <p class="boss-sub">Set the page range for each new PDF. Add more rows for more files.</p>
-
-      <div id="sectionList" class="section-list"></div>
+      <p class="boss-sub" id="splitModeHint">Set the page range for each new PDF. Add more rows for more files.</p>
 
       <div class="page-toolbar">
-        <button id="addSectionBtn" class="ghost small" type="button">+ Add another PDF</button>
-        <button id="autoSplitBtn" class="ghost small" type="button" title="Each page becomes its own PDF">⚡ One PDF per page</button>
+        <span class="toolbar-label">Mode</span>
+        <button class="ghost small active" data-split-mode="ranges" type="button" title="One output PDF per page range">Ranges</button>
+        <button class="ghost small" data-split-mode="pick" type="button" title="Click pages in the preview to build one PDF">Pick pages</button>
+      </div>
+
+      <div id="rangesBlock">
+        <div id="sectionList" class="section-list"></div>
+
+        <div id="rangesToolbar" class="page-toolbar">
+          <button id="addSectionBtn" class="ghost small" type="button">+ Add another PDF</button>
+          <button id="autoSplitBtn" class="ghost small" type="button" title="Each page becomes its own PDF">⚡ One PDF per page</button>
+          <span class="toolbar-divider"></span>
+          <span id="splitSummary" class="hint" style="margin:0;"></span>
+        </div>
+      </div>
+
+      <div id="pickPanel" class="page-toolbar pick-panel hidden">
+        <button id="pickClearBtn" class="ghost small" type="button">Clear all</button>
         <span class="toolbar-divider"></span>
-        <span id="splitSummary" class="hint" style="margin:0;"></span>
+        <span class="toolbar-label">Pages</span>
+        <input id="pickInput" class="pick-input" type="text"
+               placeholder="click tiles or type e.g. 1, 5, 9-12"
+               autocomplete="off" spellcheck="false" />
+        <span id="pickCount" class="pick-count warn">0 pages</span>
       </div>
 
       <div class="preview-block">
         <div class="preview-header">
           <span class="preview-label">Preview</span>
-          <span class="preview-hint">colored rings show which PDF each page goes into</span>
+          <span id="splitPreviewHint" class="preview-hint">colored rings show which PDF each page goes into · hover to zoom</span>
         </div>
         <div id="splitThumbs" class="thumbgrid" aria-label="Pages"></div>
       </div>
@@ -215,6 +233,11 @@
     <small>boss-pdf · runs locally · files never leave your machine</small>
   </footer>
 
-  <script src="/static/app.js?v=10"></script>
+  <div id="zoomPopup" class="zoom-popup hidden" aria-hidden="true">
+    <canvas id="zoomCanvas"></canvas>
+    <div class="zoom-label" id="zoomLabel"></div>
+  </div>
+
+  <script src="/static/app.js?v=13"></script>
 </body>
 </html>

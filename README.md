@@ -90,7 +90,7 @@ Returns the `.xlsx` as an attachment, or a JSON `{detail: "..."}` error.
 
 ## Limits
 
-- 50 MB per upload
+- 500 MB per upload
 - Conversion quality depends on the PDF. Native (text-layer) PDFs with structured tables are near-perfect. Heavily scanned, multi-column, or visually-complex pages are best-effort.
 
 ## Project layout
