@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -115,6 +116,51 @@ def health() -> dict:
     return {"ok": True}
 
 
+def _ar_convert_sync(pdf_bytes: bytes) -> io.BytesIO:
+    """Parse a JDE 'A/R Details with Aging' PDF into the template1.xlsx layout."""
+    import sys
+    import tempfile
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from ar_to_excel import export as ar_export, parse as ar_parse
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_bytes)
+        tmp = f.name
+    try:
+        data = ar_parse(tmp)
+        buf = io.BytesIO()
+        ar_export(data, buf, template_path=str(ROOT / "template1.xlsx"))
+        buf.seek(0)
+        return buf
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+@app.post("/api/ar/convert")
+async def ar_convert(file: UploadFile = File(...)):
+    """Upload an A/R Aging PDF, get the template-formatted .xlsx. No auth — this
+    converter doesn't touch the user database."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Please upload a .pdf file.")
+    pdf_bytes = await file.read()
+    _validate_pdf(pdf_bytes)
+    try:
+        buf = await run_in_threadpool(_ar_convert_sync, pdf_bytes)
+    except Exception as e:
+        log.exception("ar convert failed")
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {e}") from e
+    out_name = os.path.splitext(_safe_filename(file.filename))[0] + ".xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
+    )
+
+
 @app.post("/api/pdf-info")
 async def pdf_info(file: UploadFile = File(...),
                    _: CurrentUser = Depends(get_current_user)) -> dict:
@@ -174,7 +220,11 @@ async def convert(file: UploadFile = File(...),
              file.filename, len(pdf_bytes), pages or "all",
              " FORCE_OCR" if force_flag else "", current_user.username)
     try:
-        result = convert_pdf_bytes(
+        # Conversion is CPU-bound and synchronous; run it in a worker thread so
+        # it doesn't block the event loop (which would freeze every other
+        # request — health checks, auth, other uploads — for the whole job).
+        result = await run_in_threadpool(
+            convert_pdf_bytes,
             pdf_bytes, pages=page_set,
             filename=file.filename, force_ocr=force_flag,
         )
@@ -381,6 +431,10 @@ if WEB.exists():
     @app.get("/login")
     def login_page() -> FileResponse:
         return FileResponse(str(WEB / "login.html"))
+
+    @app.get("/ar")
+    def ar_page() -> FileResponse:
+        return FileResponse(str(WEB / "ar.html"))
 
     @app.get("/usage")
     def usage_page() -> FileResponse:

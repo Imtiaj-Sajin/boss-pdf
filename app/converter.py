@@ -115,17 +115,6 @@ class PageResult:
 
 # ---------- Char-level helpers (pdfplumber) ----------
 
-def _chars_in_bbox(chars: list[dict], bbox: tuple[float, float, float, float]) -> list[dict]:
-    x0, top, x1, bottom = bbox
-    out = []
-    for c in chars:
-        cx = (c["x0"] + c["x1"]) / 2
-        cy = (c["top"] + c["bottom"]) / 2
-        if x0 <= cx <= x1 and top <= cy <= bottom:
-            out.append(c)
-    return out
-
-
 def _is_bold(chars: list[dict]) -> bool:
     if not chars:
         return False
@@ -222,22 +211,48 @@ _TABLE_SETTINGS_OPTIONS = (
 )
 
 
+def _char_in_bbox(ch: dict, bbox: tuple[float, float, float, float]) -> bool:
+    """Center-point membership test — identical to pdfplumber's own Table.extract,
+    so style chars match the chars the text was extracted from."""
+    x0, top, x1, bottom = bbox
+    h = (ch["x0"] + ch["x1"]) / 2
+    v = (ch["top"] + ch["bottom"]) / 2
+    return x0 <= h < x1 and top <= v < bottom
+
+
 def _extract_rich_table_from_pdfplumber(page, table) -> RichTable:
-    """Pull a pdfplumber Table into a RichTable with style info from chars."""
+    """Pull a pdfplumber Table into a RichTable with style info from chars.
+
+    Mirrors pdfplumber's own Table.extract() bucketing: filter the page chars
+    down to each row once, then to each cell from that small set, and extract
+    text directly from the cell chars. This avoids a full-page within_bbox()
+    crop per cell — which was O(cells × page-objects) and the dominant cost on
+    dense tables (32M+ bbox-overlap calls on a single report). Text and style
+    now come from the same one pass over the chars."""
+    from pdfplumber.utils import extract_text as _pp_extract_text
+
     chars = page.chars
     rows: list[list[RichCell]] = []
     for row in table.rows:
+        try:
+            row_chars = [c for c in chars if _char_in_bbox(c, row.bbox)]
+        except Exception:
+            row_chars = []
         rich_row: list[RichCell] = []
         for cell_bbox in row.cells:
             if cell_bbox is None:
                 rich_row.append(RichCell())
                 continue
-            try:
-                sub = page.within_bbox(cell_bbox)
-                text = _clean_cell_text(sub.extract_text(x_tolerance=2, y_tolerance=2))
-            except Exception:
+            cell_chars = [c for c in row_chars if _char_in_bbox(c, cell_bbox)]
+            if cell_chars:
+                try:
+                    text = _clean_cell_text(
+                        _pp_extract_text(cell_chars, x_tolerance=2, y_tolerance=2)
+                    )
+                except Exception:
+                    text = ""
+            else:
                 text = ""
-            cell_chars = _chars_in_bbox(chars, cell_bbox)
             style = CellStyle(
                 bold=_is_bold(cell_chars),
                 color_hex=_dominant_color(cell_chars),
@@ -329,6 +344,28 @@ def _camelot_pages(pdf_path: str, flavor: str, page_count: int,
                 out.setdefault(page, []).append(norm)
         except Exception as e:
             logger.warning("camelot %s parse failed: %s", flavor, e)
+    return out
+
+
+# Above this pdfplumber score, a page is considered well-extracted and Camelot
+# is skipped for it. Camelot drives Ghostscript and is by far the slowest native
+# engine; running it (twice — lattice + stream) on every page of a large PDF was
+# the main reason big files crawled or timed out. A real table scores well into
+# the double digits, so this gate only lets Camelot near pages pdfplumber fumbled.
+_CAMELOT_SCORE_GATE = 5.0
+
+
+def _camelot_page(pdf_path: str, page_num: int, page_count: int) -> dict[str, list[RichTable]]:
+    """Run Camelot for a SINGLE page, on demand. Returns {'lattice': [...],
+    'stream': [...]}. Only called for pages pdfplumber couldn't handle, so the
+    Ghostscript cost is paid a handful of times instead of once per page."""
+    out: dict[str, list[RichTable]] = {"lattice": [], "stream": []}
+    if not _HAS_CAMELOT:
+        return out
+    one = {page_num}
+    for flavor in ("lattice", "stream"):
+        d = _camelot_pages(pdf_path, flavor, page_count, pages=one)
+        out[flavor] = d.get(page_num, [])
     return out
 
 
@@ -967,14 +1004,10 @@ def _convert_pdf_to_workbook_full(
     else:
         page_count = len(pp_results)
 
-    # Skip camelot in force-OCR mode — its output is also from the text layer
-    # we explicitly want to ignore.
-    if force_ocr:
-        lattice, stream = {}, {}
-    else:
-        lattice = _camelot_pages(pdf_path, "lattice", page_count, pages=pages)
-        stream = _camelot_pages(pdf_path, "stream", page_count, pages=pages)
-
+    # Camelot is no longer bulk-run over the whole document up front (that was
+    # the big-PDF killer). It's invoked lazily per page below, and only for
+    # pages pdfplumber couldn't extract well. In force-OCR mode it's skipped
+    # entirely — its output also comes from the text layer we want to ignore.
     chosen: list[PageResult] = []
     for r in pp_results:
         if force_ocr:
@@ -993,16 +1026,21 @@ def _convert_pdf_to_workbook_full(
             candidates = [(r.score, "pdfplumber", r.tables, r.title_lines)]
             logger.info("  pdfplumber: %d tables, score=%.2f",
                         len(r.tables), r.score)
-            if r.page_num in lattice:
-                ts = lattice[r.page_num]
-                sc = sum(_score_table(t) for t in ts)
-                candidates.append((sc, "camelot-lattice", ts, []))
-                logger.info("  camelot/lattice: %d tables, score=%.2f", len(ts), sc)
-            if r.page_num in stream:
-                ts = stream[r.page_num]
-                sc = sum(_score_table(t) for t in ts)
-                candidates.append((sc, "camelot-stream", ts, []))
-                logger.info("  camelot/stream:  %d tables, score=%.2f", len(ts), sc)
+
+            # Only fall back to Camelot when pdfplumber came up empty or weak on
+            # this page — not on every page. Strong pdfplumber pages skip the
+            # (slow) Ghostscript round-trip entirely.
+            if _HAS_CAMELOT and (not r.tables or r.score < _CAMELOT_SCORE_GATE):
+                cp = _camelot_page(pdf_path, r.page_num, page_count)
+                for flavor, tag in (("lattice", "camelot-lattice"),
+                                    ("stream", "camelot-stream")):
+                    ts = cp[flavor]
+                    if ts:
+                        sc = sum(_score_table(t) for t in ts)
+                        candidates.append((sc, tag, ts, []))
+                        logger.info("  %s: %d tables, score=%.2f", tag, len(ts), sc)
+            elif _HAS_CAMELOT:
+                logger.info("  camelot: skipped (pdfplumber strong, score=%.2f)", r.score)
 
             # Auto-route to OCR when native is weak/empty
             best_native = max((c[0] for c in candidates), default=0.0)
@@ -1207,6 +1245,11 @@ def _write_rich_table(ws, table: RichTable, start_row: int, n_cols: int) -> int:
 _BANNER_FILL = PatternFill(start_color="FF1F4E79", end_color="FF1F4E79", fill_type="solid")
 _BLANK_ROWS_BETWEEN_PAGES = 2
 
+# Hard ceiling of the .xlsx format. A single worksheet cannot hold more rows
+# than this; openpyxl raises if you try. The combined "All pages" sheet stacks
+# every page, so on a large PDF it's the one place that can hit the wall.
+_XLSX_MAX_ROWS = 1_048_576
+
 
 def _write_page_banner(ws, page_num: int, n_cols: int, row: int) -> int:
     """Write a single 'Page N' label row spanning n_cols. Returns next row."""
@@ -1241,8 +1284,22 @@ def _build_combined_sheet(wb: Workbook, pages: list[PageResult]) -> None:
 
     ws = wb.create_sheet(title="All pages")
 
+    # Leave headroom so a page's banner + tables can't tip a near-full sheet
+    # over the hard row limit mid-write (which would make openpyxl raise and
+    # fail the whole conversion).
+    row_budget = _XLSX_MAX_ROWS - 1000
+
     next_row = 1
     for i, page in enumerate(pages_with_tables):
+        page_rows = 1 + sum(len(t) + 1 for t in page.tables) + len(page.title_lines)
+        if next_row + page_rows >= row_budget:
+            note = ws.cell(row=next_row, column=1,
+                           value=(f"[ Combined sheet truncated at page {page.page_num}: "
+                                  f"the .xlsx row limit ({_XLSX_MAX_ROWS:,}) was reached. "
+                                  f"Every page is still on its own tab. ]"))
+            note.font = Font(bold=True, italic=True, color="FFB00020")
+            logger.warning("combined sheet truncated at page %d (row limit)", page.page_num)
+            break
         next_row = _write_page_banner(ws, page.page_num, n_cols, next_row)
         if page.title_lines:
             next_row = _write_title_rows(ws, page.title_lines, n_cols, next_row)
