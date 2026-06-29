@@ -164,7 +164,11 @@ def _header_geometry(line):
     i61 = find("61"); centers["61-90"] = mid(i61, find("90", i61))
     i91 = find("91"); centers["91-120"] = mid(i91, find("120", i91))
     io = find("Over"); centers["Over120"] = mid(io, find("120", io))
-    remark_x = next((c for t, c in toks if t == "Remark"), 745.0)
+    # Anchor the remark column on the LEFT edge (x0) of the 'Remark' header, not
+    # its center — otherwise the threshold sits too far right and short
+    # continuation words (e.g. a lone 'RENT') whose center falls left of it get
+    # dropped, truncating multi-line remarks to their first line.
+    remark_x = next((w["x0"] for w in line if w["text"] == "Remark"), 745.0)
     return centers, centers["Current"], remark_x
 
 
