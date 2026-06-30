@@ -56,10 +56,32 @@
           PDFs in. Spreadsheets out.
           <br>
           Or <button id="pickBtn" class="link-btn" type="button">choose a file</button>
+          &nbsp;·&nbsp; <button id="pickFolderBtn" class="link-btn" type="button">a whole folder</button>
           &nbsp;·&nbsp; up to 500&nbsp;MB
         </p>
         <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden />
+        <input type="file" id="folderInput" webkitdirectory directory multiple hidden />
       </div>
+    </section>
+
+    <!-- STEP 1b: folder / batch -->
+    <section id="batch" class="card hidden">
+      <div class="filebar">
+        <span class="memo">Batch department</span>
+        <span id="batchName" class="fname"></span>
+        <span id="batchCount" class="fsize"></span>
+      </div>
+      <h2 class="boss-line">A folder, huh? The boss likes efficiency.</h2>
+      <p class="boss-sub">Convert every PDF at once, or send them to the Data Puller to pull the same fields from each.</p>
+
+      <div id="batchList" class="section-list" style="max-height:260px;overflow:auto"></div>
+
+      <div class="row-actions">
+        <button id="batchConvertBtn" class="primary" type="button">Convert all → ZIP</button>
+        <button id="batchPullerBtn" class="ghost" type="button">🎯 Data Puller</button>
+        <button id="batchBack" class="ghost" type="button">← Back</button>
+      </div>
+      <p class="msg" id="batchMsg" style="margin-top:10px;min-height:18px"></p>
     </section>
 
     <!-- STEP 2: choose tool -->
@@ -239,5 +261,70 @@
   </div>
 
   <script src="/static/app.js?v=13"></script>
+  <script>
+  // ---- Folder upload: batch convert + Data Puller handoff ----
+  (function(){
+    const $ = id => document.getElementById(id);
+    const dropzone = $("dropzone"), batch = $("batch");
+    let batchFiles = [];
+
+    function show(el){ el.classList.remove("hidden"); }
+    function hide(el){ el.classList.add("hidden"); }
+    function bmsg(t, kind){ const m=$("batchMsg"); m.textContent=t||""; m.style.color = kind==="bad"?"#e9806e":kind==="ok"?"#5fdfb0":"#e0bd72"; }
+
+    $("pickFolderBtn").addEventListener("click", ()=> $("folderInput").click());
+    $("folderInput").addEventListener("change", e=>{
+      const pdfs = [...e.target.files].filter(f => /\.pdf$/i.test(f.name));
+      if(!pdfs.length){ bmsg("No PDFs in that folder.", "bad"); return; }
+      batchFiles = pdfs;
+      $("batchName").textContent = "selected folder";
+      $("batchCount").textContent = pdfs.length + (pdfs.length===1?" PDF":" PDFs");
+      $("batchList").innerHTML = pdfs.map(f=>`<div class="section-row" style="padding:6px 10px">${f.name.replace(/[&<>]/g,'')}</div>`).join("");
+      bmsg("");
+      hide(dropzone); show(batch);
+    });
+    $("batchBack").addEventListener("click", ()=>{ hide(batch); show(dropzone); $("folderInput").value=""; });
+
+    // Convert all -> ZIP (uses the auth-gated batch endpoint)
+    $("batchConvertBtn").addEventListener("click", async ()=>{
+      if(!batchFiles.length) return;
+      $("batchConvertBtn").disabled = true; $("batchPullerBtn").disabled = true;
+      bmsg(`Converting ${batchFiles.length} PDFs… this can take a while.`, "work");
+      const fd = new FormData();
+      const forceEl = $("forceOcr"); if(forceEl && forceEl.checked) fd.append("force_ocr","true");
+      batchFiles.forEach(f=> fd.append("files", f, f.name));
+      try{
+        const res = await BossAuth.authFetch("/api/convert-batch", { method:"POST", body:fd });
+        if(!res.ok){ const j=await res.json().catch(()=>({})); throw new Error(j.detail || ("HTTP "+res.status)); }
+        const blob = await res.blob();
+        const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+        a.download="boss-pdf-batch.zip"; a.click(); URL.revokeObjectURL(a.href);
+        bmsg("Done — boss-pdf-batch.zip downloaded.", "ok");
+      }catch(err){ bmsg(err.message || "Batch convert failed.", "bad"); }
+      $("batchConvertBtn").disabled = false; $("batchPullerBtn").disabled = false;
+    });
+
+    // Data Puller -> stash files in IndexedDB, hand off to /datapuller
+    $("batchPullerBtn").addEventListener("click", async ()=>{
+      if(!batchFiles.length) return;
+      bmsg("Opening Data Puller…", "work");
+      try{ await writeHandoff(batchFiles); }catch(_){}
+      location.href = "/datapuller";
+    });
+
+    function writeHandoff(files){
+      return new Promise((res,rej)=>{
+        const r = indexedDB.open("bosspdf-handoff",1);
+        r.onupgradeneeded = ()=> r.result.createObjectStore("h");
+        r.onsuccess = ()=>{ const db=r.result;
+          const tx=db.transaction("h","readwrite");
+          tx.objectStore("h").put(files,"pdfs");
+          tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error);
+        };
+        r.onerror = ()=>rej(r.error);
+      });
+    }
+  })();
+  </script>
 </body>
 </html>

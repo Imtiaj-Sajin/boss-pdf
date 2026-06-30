@@ -140,6 +140,104 @@ def _ar_convert_sync(pdf_bytes: bytes) -> io.BytesIO:
             pass
 
 
+@app.post("/api/datapuller/export")
+async def datapuller_export(files: list[UploadFile] = File(...),
+                            regions: str = Form(...)):
+    """Pull named rectangular regions from many same-layout PDFs into one
+    row-per-file Excel table. No auth — pure file-in/file-out."""
+    import json
+
+    from .datapuller import Region, build_xlsx, extract
+
+    try:
+        raw = json.loads(regions)
+        regs = [
+            Region(name=str(r["name"]).strip() or f"field{i+1}",
+                   page=int(r.get("page", 1)),
+                   x0=r["x0"], y0=r["y0"], x1=r["x1"], y1=r["y1"])
+            for i, r in enumerate(raw)
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid regions: {e}") from e
+    if not regs:
+        raise HTTPException(status_code=400, detail="No datapoints were defined.")
+
+    # column order = first appearance of each distinct name
+    column_names = list(dict.fromkeys(r.name for r in regs))
+
+    filenames: list[str] = []
+    rows: list[dict] = []
+    for uf in files:
+        if not uf.filename or not uf.filename.lower().endswith(".pdf"):
+            continue
+        b = await uf.read()
+        if b[:5] != b"%PDF-":
+            continue
+        try:
+            row = await run_in_threadpool(extract, b, regs)
+        except Exception:
+            log.exception("datapuller extract failed for %s", uf.filename)
+            row = {}
+        filenames.append(uf.filename)
+        rows.append(row)
+
+    if not filenames:
+        raise HTTPException(status_code=400, detail="No valid PDFs in the upload.")
+
+    xlsx = await run_in_threadpool(build_xlsx, filenames, rows, column_names)
+    return StreamingResponse(
+        io.BytesIO(xlsx),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="datapuller.xlsx"'},
+    )
+
+
+@app.post("/api/convert-batch")
+async def convert_batch(files: list[UploadFile] = File(...),
+                        pages: Optional[str] = Form(None),
+                        force_ocr: Optional[str] = Form(None),
+                        x_session_id: Optional[str] = Header(None),
+                        current_user: CurrentUser = Depends(get_current_user),
+                        db: Session = Depends(get_db)):
+    """Convert a whole folder of PDFs in one shot; returns a ZIP of .xlsx files.
+    Same conversion as /api/convert, looped per file."""
+    force_flag = (force_ocr or "").lower() in ("true", "1", "yes", "on")
+    zip_buf = io.BytesIO()
+    n_ok = 0
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for uf in files:
+            if not uf.filename or not uf.filename.lower().endswith(".pdf"):
+                continue
+            pdf_bytes = await uf.read()
+            if pdf_bytes[:5] != b"%PDF-" or len(pdf_bytes) > MAX_BYTES:
+                continue
+            try:
+                result = await run_in_threadpool(
+                    convert_pdf_bytes, pdf_bytes, None, uf.filename, force_flag,
+                )
+            except Exception:
+                log.exception("batch convert failed for %s", uf.filename)
+                continue
+            stem = os.path.splitext(_safe_filename(uf.filename))[0]
+            zf.writestr(f"{stem}.xlsx", result.xlsx_bytes)
+            n_ok += 1
+            usage_mod.log_usage(
+                db, user=current_user, session_id=x_session_id,
+                operation="convert", batch_name=uf.filename,
+                file_names=[uf.filename], files_processed=1,
+                pages_processed=len(result.pages_summary),
+                tables_extracted=sum(int(p.get("tables") or 0) for p in result.pages_summary),
+                ocr_used=bool(result.ocr_used), ocr_engine=result.ocr_engine or None,
+            )
+    if n_ok == 0:
+        raise HTTPException(status_code=400, detail="No PDFs could be converted.")
+    zip_buf.seek(0)
+    return StreamingResponse(
+        zip_buf, media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="boss-pdf-batch.zip"'},
+    )
+
+
 @app.post("/api/ar/convert")
 async def ar_convert(file: UploadFile = File(...)):
     """Upload an A/R Aging PDF, get the template-formatted .xlsx. No auth — this
@@ -435,6 +533,10 @@ if WEB.exists():
     @app.get("/ar")
     def ar_page() -> FileResponse:
         return FileResponse(str(WEB / "ar.html"))
+
+    @app.get("/datapuller")
+    def datapuller_page() -> FileResponse:
+        return FileResponse(str(WEB / "datapuller.html"))
 
     @app.get("/usage")
     def usage_page() -> FileResponse:

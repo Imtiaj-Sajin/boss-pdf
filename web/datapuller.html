@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Puller · boss-pdf</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,'Segoe UI',Inter,sans-serif;background:#0d0e16;color:#f1eee7;margin:0}
+  header{display:flex;align-items:center;gap:16px;padding:14px 22px;border-bottom:1px solid #2a2d3b;background:#12131d}
+  header h1{font-family:Georgia,serif;color:#c9a15a;margin:0;font-size:20px}
+  header .sub{color:#8a8576;font-size:12px;font-style:italic}
+  header .spacer{flex:1}
+  button,.btn{font-family:inherit;border:0;border-radius:9px;padding:9px 14px;font-weight:600;font-size:13px;cursor:pointer}
+  .primary{background:#c9a15a;color:#1a1206}
+  .ghost{background:#1d1f2b;color:#e7e3d8;border:1px solid #333748}
+  button:disabled{opacity:.45;cursor:default}
+  main{display:grid;grid-template-columns:210px 1fr 280px;gap:0;height:calc(100vh - 59px)}
+  .col{overflow:auto;padding:14px}
+  .col.files{border-right:1px solid #2a2d3b}
+  .col.side{border-left:1px solid #2a2d3b}
+  .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:#7a7585;margin:0 0 8px}
+  .filetile{padding:8px 10px;border-radius:8px;background:#171823;border:1px solid #262936;margin-bottom:6px;
+            font-size:12.5px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .filetile.active{border-color:#c9a15a;background:#1d1d28}
+  .filetile.pulse{animation:pulse .8s ease}
+  @keyframes pulse{0%{background:#3a2f12}100%{background:#171823}}
+  .stagewrap{display:flex;flex-direction:column;align-items:center;gap:10px}
+  .toolbar{display:flex;align-items:center;gap:10px;width:100%;justify-content:center;flex-wrap:wrap}
+  .toolbar .pg{color:#b9b3a6;font-size:13px;min-width:96px;text-align:center}
+  #stage{position:relative;line-height:0;box-shadow:0 6px 30px rgba(0,0,0,.5);background:#fff}
+  #overlay{position:absolute;left:0;top:0;cursor:crosshair}
+  .hint{color:#8a8576;font-size:12px;text-align:center;max-width:560px}
+  .region{background:#171823;border:1px solid #262936;border-radius:8px;padding:8px 10px;margin-bottom:7px}
+  .region .nm{font-weight:600;font-size:13px;color:#f1eee7;display:flex;justify-content:space-between;align-items:center}
+  .region .meta{color:#7a7585;font-size:11px;margin-top:3px}
+  .region .x{color:#e9806e;cursor:pointer;font-weight:700;padding:0 4px}
+  .drop{border:2px dashed #3a3d4e;border-radius:12px;padding:40px 20px;text-align:center;cursor:pointer;background:#0f1018;margin:auto;max-width:520px;margin-top:8vh}
+  .drop.hover{border-color:#c9a15a}
+  .drop b{color:#f1eee7}
+  input[type=file]{display:none}
+  .msg{font-size:13px;margin-top:8px;min-height:18px}
+  .ok{color:#5fdfb0}.bad{color:#e9806e}.work{color:#e0bd72}
+  .badge{background:#23364f;color:#9ec5ff;border-radius:20px;padding:2px 9px;font-size:11px;margin-left:6px}
+</style></head><body>
+
+<header>
+  <h1>Data Puller</h1>
+  <span class="sub">draw a box, name it, pull it from every PDF</span>
+  <span class="spacer"></span>
+  <button id="copyAll" class="ghost" disabled title="Apply all selectors to every PDF">⧉ Copy to all PDFs</button>
+  <button id="export" class="primary" disabled>Export to Excel</button>
+  <a class="btn ghost" href="/" style="text-decoration:none">← boss-pdf</a>
+</header>
+
+<!-- empty state: pick a folder -->
+<section id="empty">
+  <label class="drop" id="drop">
+    <div style="font-size:34px">📁</div>
+    <div><b>Choose a folder</b> of PDFs (or drop files here)</div>
+    <div class="hint" style="margin-top:8px">Same-layout PDFs work best — selectors drawn once apply to all.</div>
+    <input type="file" id="folder" webkitdirectory directory multiple>
+    <input type="file" id="filesInput" accept="application/pdf,.pdf" multiple>
+    <div style="margin-top:14px">
+      <button class="primary" type="button" id="pickFolder">Select folder</button>
+      <button class="ghost" type="button" id="pickFiles">Select files</button>
+    </div>
+    <div class="msg" id="emptyMsg"></div>
+  </label>
+</section>
+
+<!-- workspace -->
+<main id="work" style="display:none">
+  <div class="col files">
+    <p class="lbl">PDFs <span id="fileCount" class="badge">0</span></p>
+    <div id="fileList"></div>
+  </div>
+
+  <div class="col">
+    <div class="stagewrap">
+      <div class="toolbar">
+        <button id="prev" class="ghost">‹ Prev</button>
+        <span class="pg" id="pageInfo">page 1 / 1</span>
+        <button id="next" class="ghost">Next ›</button>
+        <span style="width:14px"></span>
+        <button id="zoomOut" class="ghost">–</button>
+        <button id="zoomIn" class="ghost">+</button>
+      </div>
+      <div id="stage"><canvas id="pdfCanvas"></canvas><canvas id="overlay"></canvas></div>
+      <div class="hint">Drag on the page to draw a selector. Release to name it. It’s pulled from this page position on <b>every</b> PDF.</div>
+      <div class="msg" id="workMsg"></div>
+    </div>
+  </div>
+
+  <div class="col side">
+    <p class="lbl">Datapoints <span id="regionCount" class="badge">0</span></p>
+    <div id="regionList"></div>
+    <p class="hint" id="noRegions">No datapoints yet. Draw a box on the page.</p>
+  </div>
+</main>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const state = {
+  files: [],            // {name, file}
+  active: 0,
+  doc: null,            // pdf.js doc for active file
+  page: 1,
+  numPages: 1,
+  scale: 1.3,
+  regions: [],          // {name, page, x0,y0,x1,y1}  normalized
+  appliedToAll: false,
+};
+
+const $ = id => document.getElementById(id);
+const pdfCanvas = $("pdfCanvas"), overlay = $("overlay");
+const octx = overlay.getContext("2d");
+
+// ---------- file intake ----------
+function acceptFiles(list){
+  const pdfs = [...list].filter(f => /\.pdf$/i.test(f.name));
+  if(!pdfs.length){ $("emptyMsg").className="msg bad"; $("emptyMsg").textContent="No PDF files found."; return; }
+  state.files = pdfs.map(f => ({name:f.name, file:f}));
+  $("empty").style.display="none";
+  $("work").style.display="grid";
+  renderFileList();
+  openFile(0);
+}
+$("pickFolder").onclick = ()=> $("folder").click();
+$("pickFiles").onclick  = ()=> $("filesInput").click();
+$("folder").onchange = e => acceptFiles(e.target.files);
+$("filesInput").onchange = e => acceptFiles(e.target.files);
+const drop = $("drop");
+drop.addEventListener("dragover", e=>{e.preventDefault();drop.classList.add("hover");});
+drop.addEventListener("dragleave", ()=>drop.classList.remove("hover"));
+drop.addEventListener("drop", e=>{e.preventDefault();drop.classList.remove("hover");acceptFiles(e.dataTransfer.files);});
+
+// ---------- handoff from main page (IndexedDB) ----------
+(async function tryHandoff(){
+  try{
+    const files = await readHandoff();
+    if(files && files.length){ acceptFiles(files); await clearHandoff(); }
+  }catch(_){}
+})();
+function readHandoff(){
+  return new Promise((res,rej)=>{
+    const r = indexedDB.open("bosspdf-handoff",1);
+    r.onupgradeneeded = ()=> r.result.createObjectStore("h");
+    r.onsuccess = ()=>{ const db=r.result;
+      if(!db.objectStoreNames.contains("h")){res(null);return;}
+      const g = db.transaction("h").objectStore("h").get("pdfs");
+      g.onsuccess = ()=> res(g.result||null); g.onerror=()=>res(null);
+    };
+    r.onerror = ()=>res(null);
+  });
+}
+function clearHandoff(){
+  return new Promise(res=>{
+    const r=indexedDB.open("bosspdf-handoff",1);
+    r.onsuccess=()=>{const db=r.result; if(!db.objectStoreNames.contains("h")){res();return;}
+      db.transaction("h","readwrite").objectStore("h").delete("pdfs").onsuccess=()=>res();};
+    r.onerror=()=>res();
+  });
+}
+
+// ---------- file list ----------
+function renderFileList(){
+  $("fileCount").textContent = state.files.length;
+  const wrap = $("fileList"); wrap.innerHTML="";
+  state.files.forEach((f,i)=>{
+    const d=document.createElement("div");
+    d.className="filetile"+(i===state.active?" active":"");
+    d.textContent=f.name; d.title=f.name;
+    d.onclick=()=>openFile(i);
+    wrap.appendChild(d);
+  });
+}
+
+// ---------- open + render ----------
+async function openFile(i){
+  state.active=i; state.page=1;
+  renderFileList();
+  const buf = await state.files[i].file.arrayBuffer();
+  state.doc = await pdfjsLib.getDocument({data:buf}).promise;
+  state.numPages = state.doc.numPages;
+  await renderPage();
+}
+async function renderPage(){
+  const page = await state.doc.getPage(state.page);
+  const vp = page.getViewport({scale:state.scale});
+  pdfCanvas.width = overlay.width = Math.floor(vp.width);
+  pdfCanvas.height = overlay.height = Math.floor(vp.height);
+  $("stage").style.width = vp.width+"px"; $("stage").style.height = vp.height+"px";
+  await page.render({canvasContext:pdfCanvas.getContext("2d"), viewport:vp}).promise;
+  $("pageInfo").textContent = `page ${state.page} / ${state.numPages}`;
+  drawRegions();
+}
+$("prev").onclick=()=>{ if(state.page>1){state.page--;renderPage();} };
+$("next").onclick=()=>{ if(state.page<state.numPages){state.page++;renderPage();} };
+$("zoomIn").onclick=()=>{ state.scale=Math.min(3,state.scale+0.2); renderPage(); };
+$("zoomOut").onclick=()=>{ state.scale=Math.max(0.6,state.scale-0.2); renderPage(); };
+
+// ---------- draw regions overlay ----------
+function drawRegions(){
+  octx.clearRect(0,0,overlay.width,overlay.height);
+  state.regions.filter(r=>r.page===state.page).forEach(r=>{
+    const x=r.x0*overlay.width, y=r.y0*overlay.height,
+          w=(r.x1-r.x0)*overlay.width, h=(r.y1-r.y0)*overlay.height;
+    octx.fillStyle="rgba(201,161,90,.18)";
+    octx.strokeStyle="#c9a15a"; octx.lineWidth=1.5;
+    octx.fillRect(x,y,w,h); octx.strokeRect(x,y,w,h);
+    octx.fillStyle="#c9a15a"; octx.font="12px sans-serif";
+    octx.fillText(r.name, x+3, y>14?y-4:y+13);
+  });
+}
+
+// ---------- mouse drawing ----------
+let dragging=false, sx=0, sy=0;
+overlay.addEventListener("mousedown", e=>{
+  const r=overlay.getBoundingClientRect();
+  sx=e.clientX-r.left; sy=e.clientY-r.top; dragging=true;
+});
+overlay.addEventListener("mousemove", e=>{
+  if(!dragging) return;
+  const r=overlay.getBoundingClientRect();
+  const cx=e.clientX-r.left, cy=e.clientY-r.top;
+  drawRegions();
+  octx.strokeStyle="#5fdfb0"; octx.lineWidth=1.5;
+  octx.fillStyle="rgba(95,223,176,.15)";
+  octx.fillRect(sx,sy,cx-sx,cy-sy); octx.strokeRect(sx,sy,cx-sx,cy-sy);
+});
+overlay.addEventListener("mouseup", e=>{
+  if(!dragging) return; dragging=false;
+  const r=overlay.getBoundingClientRect();
+  let ex=e.clientX-r.left, ey=e.clientY-r.top;
+  let x0=Math.min(sx,ex), y0=Math.min(sy,ey), x1=Math.max(sx,ex), y1=Math.max(sy,ey);
+  if(x1-x0<5 || y1-y0<5){ drawRegions(); return; }   // ignore tiny drags
+  const name = (prompt("Name this datapoint:", `field ${state.regions.length+1}`)||"").trim();
+  if(!name){ drawRegions(); return; }
+  state.regions.push({
+    name, page: state.page,
+    x0:x0/overlay.width, y0:y0/overlay.height,
+    x1:x1/overlay.width, y1:y1/overlay.height,
+  });
+  renderRegions(); drawRegions();
+});
+
+// ---------- region list ----------
+function renderRegions(){
+  $("regionCount").textContent = state.regions.length;
+  $("noRegions").style.display = state.regions.length? "none":"block";
+  const wrap=$("regionList"); wrap.innerHTML="";
+  state.regions.forEach((r,i)=>{
+    const d=document.createElement("div"); d.className="region";
+    d.innerHTML = `<div class="nm">${escapeHtml(r.name)} <span class="x" title="remove">✕</span></div>
+                   <div class="meta">page ${r.page}</div>`;
+    d.querySelector(".x").onclick=()=>{ state.regions.splice(i,1); renderRegions(); drawRegions(); updateButtons(); };
+    wrap.appendChild(d);
+  });
+  updateButtons();
+}
+function updateButtons(){
+  const has = state.regions.length>0;
+  $("copyAll").disabled = !has || state.files.length<2;
+  $("export").disabled = !has;
+}
+function escapeHtml(s){return s.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+// ---------- copy to all ----------
+$("copyAll").onclick=()=>{
+  state.appliedToAll=true;
+  document.querySelectorAll(".filetile").forEach(t=>{t.classList.remove("pulse");void t.offsetWidth;t.classList.add("pulse");});
+  toast(`${state.regions.length} selector(s) will be pulled from all ${state.files.length} PDFs.`, "ok");
+};
+
+// ---------- export ----------
+$("export").onclick=async()=>{
+  if(!state.regions.length) return;
+  const targets = state.appliedToAll ? state.files : [state.files[state.active]];
+  toast(`Pulling ${state.regions.length} datapoint(s) from ${targets.length} PDF(s)…`, "work");
+  $("export").disabled=true;
+  const fd=new FormData();
+  fd.append("regions", JSON.stringify(state.regions));
+  targets.forEach(t=>fd.append("files", t.file, t.name));
+  try{
+    const res=await fetch("/api/datapuller/export",{method:"POST",body:fd});
+    if(!res.ok){const j=await res.json().catch(()=>({}));throw new Error(j.detail||"Export failed.");}
+    const blob=await res.blob();
+    const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+    a.download="datapuller.xlsx"; a.click(); URL.revokeObjectURL(a.href);
+    toast("Done — datapuller.xlsx downloaded.", "ok");
+  }catch(e){ toast(e.message,"bad"); }
+  $("export").disabled=false;
+};
+function toast(msg,kind){ const m=$("workMsg"); m.className="msg "+(kind||""); m.textContent=msg; }
+</script>
+</body></html>
