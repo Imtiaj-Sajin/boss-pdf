@@ -135,7 +135,36 @@ $("filesInput").onchange = e => acceptFiles(e.target.files);
 const drop = $("drop");
 drop.addEventListener("dragover", e=>{e.preventDefault();drop.classList.add("hover");});
 drop.addEventListener("dragleave", ()=>drop.classList.remove("hover"));
-drop.addEventListener("drop", e=>{e.preventDefault();drop.classList.remove("hover");acceptFiles(e.dataTransfer.files);});
+drop.addEventListener("drop", async e=>{
+  e.preventDefault(); drop.classList.remove("hover");
+  $("emptyMsg").className="msg work"; $("emptyMsg").textContent="Reading folder…";
+  const files = await filesFromDataTransfer(e.dataTransfer);
+  acceptFiles(files);
+});
+
+// Read a drop that may contain folders (recursively) OR loose files.
+async function filesFromDataTransfer(dt){
+  const items = dt.items ? [...dt.items] : [];
+  const entries = items.map(it => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean);
+  if(!entries.length) return [...dt.files];     // fallback: plain files
+  const out = [];
+  await Promise.all(entries.map(en => walkEntry(en, out)));
+  return out;
+}
+function walkEntry(entry, out){
+  return new Promise(resolve=>{
+    if(entry.isFile){
+      entry.file(f=>{ out.push(f); resolve(); }, ()=>resolve());
+    } else if(entry.isDirectory){
+      const reader = entry.createReader(); const kids = [];
+      const readBatch = ()=> reader.readEntries(ents=>{
+        if(!ents.length){ Promise.all(kids.map(k=>walkEntry(k,out))).then(resolve); return; }
+        kids.push(...ents); readBatch();
+      }, ()=>resolve());
+      readBatch();
+    } else resolve();
+  });
+}
 
 // ---------- handoff from main page (IndexedDB) ----------
 (async function tryHandoff(){

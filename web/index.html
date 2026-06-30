@@ -30,6 +30,7 @@
       </div>
     </div>
     <div class="header-right">
+      <a href="/datapuller" class="header-link">Data Puller</a>
       <a href="/usage" class="header-link">Usage</a>
       <div id="userChip" class="user-chip hidden" title="Signed in">
         <span class="user-avatar" id="userAvatar">·</span>
@@ -272,18 +273,51 @@
     function hide(el){ el.classList.add("hidden"); }
     function bmsg(t, kind){ const m=$("batchMsg"); m.textContent=t||""; m.style.color = kind==="bad"?"#e9806e":kind==="ok"?"#5fdfb0":"#e0bd72"; }
 
-    $("pickFolderBtn").addEventListener("click", ()=> $("folderInput").click());
-    $("folderInput").addEventListener("change", e=>{
-      const pdfs = [...e.target.files].filter(f => /\.pdf$/i.test(f.name));
-      if(!pdfs.length){ bmsg("No PDFs in that folder.", "bad"); return; }
+    function loadBatch(pdfs){
+      if(!pdfs || !pdfs.length){ bmsg("No PDFs found in that drop/folder.", "bad"); show(batch); hide(dropzone); return; }
       batchFiles = pdfs;
       $("batchName").textContent = "selected folder";
       $("batchCount").textContent = pdfs.length + (pdfs.length===1?" PDF":" PDFs");
       $("batchList").innerHTML = pdfs.map(f=>`<div class="section-row" style="padding:6px 10px">${f.name.replace(/[&<>]/g,'')}</div>`).join("");
       bmsg("");
       hide(dropzone); show(batch);
+    }
+    $("pickFolderBtn").addEventListener("click", ()=> $("folderInput").click());
+    $("folderInput").addEventListener("change", e=>{
+      loadBatch([...e.target.files].filter(f => /\.pdf$/i.test(f.name)));
     });
     $("batchBack").addEventListener("click", ()=>{ hide(batch); show(dropzone); $("folderInput").value=""; });
+
+    // Folder / multi-file drag-and-drop onto the dropzone.
+    // A single-file drop is left alone so the existing single-file handler runs.
+    dropzone.addEventListener("drop", e=>{
+      const dt = e.dataTransfer; if(!dt) return;
+      const items = dt.items ? [...dt.items] : [];
+      const entries = items.map(it => it.webkitGetAsEntry ? it.webkitGetAsEntry() : null).filter(Boolean);
+      const hasDir = entries.some(en => en.isDirectory);
+      const multi = dt.files && dt.files.length > 1;
+      if(!hasDir && !multi) return;                 // single file -> let app.js handle it
+      e.preventDefault(); e.stopImmediatePropagation();
+      (async ()=>{
+        let all = [];
+        if(entries.length){ for(const en of entries) await walkEntry(en, all); }
+        else all = [...dt.files];
+        loadBatch(all.filter(f => /\.pdf$/i.test(f.name)));
+      })();
+    }, true);
+    function walkEntry(entry, out){
+      return new Promise(resolve=>{
+        if(entry.isFile){ entry.file(f=>{ out.push(f); resolve(); }, ()=>resolve()); }
+        else if(entry.isDirectory){
+          const rd = entry.createReader(); const kids = [];
+          const rb = ()=> rd.readEntries(ents=>{
+            if(!ents.length){ Promise.all(kids.map(k=>walkEntry(k,out))).then(resolve); return; }
+            kids.push(...ents); rb();
+          }, ()=>resolve());
+          rb();
+        } else resolve();
+      });
+    }
 
     // Convert all -> ZIP (uses the auth-gated batch endpoint)
     $("batchConvertBtn").addEventListener("click", async ()=>{
