@@ -26,6 +26,7 @@ import tempfile
 import pdfplumber
 
 from .converter import (
+    _CAMELOT_SCORE_GATE,
     _HAS_CAMELOT,
     _TABLE_SETTINGS_OPTIONS,
     _build_workbook,
@@ -147,6 +148,13 @@ def _best_grid(pdf_path: str, page, page_num: int) -> tuple[str, float, list[flo
         if score > best[1]:
             best = ("pdfplumber", score, xs, ys)
 
+    # Only reach for camelot when pdfplumber came up weak — the same gate core
+    # uses. Camelot drives Ghostscript and is by far the slowest engine, so
+    # running it on every page (as this used to) makes detecting a whole
+    # document cost N Ghostscript round-trips for nothing.
+    if best[1] >= _CAMELOT_SCORE_GATE:
+        return best
+
     for flavor in ("lattice", "stream"):
         for t in _camelot_tables(pdf_path, page_num, flavor):
             score = _score_table(_camelot_rich(t))
@@ -227,19 +235,25 @@ def _drop_empty_rows(table):
 
 
 def _page_result(page, page_num: int, columns: list[float],
-                 rows: list[float] | None, auto_rows: bool,
+                 rows: list[float] | None = None,
                  drop_empty: bool = True) -> PageResult:
-    """Re-run boss-pdf's extraction on one page using the user's column lines."""
+    """Re-run boss-pdf's extraction on one page using the user's column lines.
+
+    `rows` is this page's OWN row lines, and only when the user actually edited
+    them. Rows drift page to page, so one page's cuts must never be forced onto
+    another — pages the user didn't touch keep boss-pdf's per-page detection,
+    which measures exactly to that page's true line count.
+    """
     w, h = float(page.width), float(page.height)
 
     # Learn the horizontal strategy boss-pdf would have picked for this page, so
-    # rows behave exactly as they do in "Make it Excel".
+    # untouched pages behave exactly as they do in "Make it Excel".
     _tables, winning = _winning_tables(page)
     settings = dict(winning or {"horizontal_strategy": "text",
                                 "intersection_tolerance": 5})
     settings["vertical_strategy"] = "explicit"
     settings["explicit_vertical_lines"] = sorted(c * w for c in columns)
-    if not auto_rows and rows:
+    if rows:
         settings["horizontal_strategy"] = "explicit"
         settings["explicit_horizontal_lines"] = sorted(r * h for r in rows)
 
@@ -277,8 +291,7 @@ def _page_result(page, page_num: int, columns: list[float],
 
 
 def scrape_all(pdf_bytes: bytes, columns: list[float],
-               rows: list[float] | None = None,
-               auto_rows: bool = True,
+               rows_by_page: dict[int, list[float]] | None = None,
                drop_empty: bool = True) -> list[PageResult]:
     """Apply the calibrated columns to every page and extract via the core."""
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
@@ -288,15 +301,18 @@ def scrape_all(pdf_bytes: bytes, columns: list[float],
     try:
         with pdfplumber.open(tmp) as pdf:
             for i, page in enumerate(pdf.pages, start=1):
-                pr = _page_result(page, i, columns, rows, auto_rows, drop_empty)
-                # If pdfplumber can't make anything of this page with these
-                # columns (e.g. a totals page it scores ~2 on), let camelot —
-                # the engine core would pick here — do it with the same columns.
-                if not pr.tables:
+                pr = _page_result(page, i, columns,
+                                  (rows_by_page or {}).get(i), drop_empty)
+                # Mirror the same gate detect() uses: when pdfplumber is weak on
+                # this page, let camelot try with the SAME calibrated columns and
+                # keep whichever scores better. Without this the export could use
+                # a different engine than the one whose grid you were shown, so
+                # the drawn lines wouldn't match the result.
+                if pr.score < _CAMELOT_SCORE_GATE:
                     alt = _camelot_page_result(
                         tmp, i, sorted(c * float(page.width) for c in columns),
                         pr.char_count, drop_empty)
-                    if alt is not None:
+                    if alt is not None and alt.score > pr.score:
                         pr = alt
                 out.append(pr)
     finally:

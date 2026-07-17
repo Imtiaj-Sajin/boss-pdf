@@ -45,9 +45,9 @@
   <span class="spacer"></span>
   <button id="addCol" class="ghost" disabled>+ Column line</button>
   <button id="addRow" class="ghost" disabled>+ Row line</button>
-  <button id="redetect" class="ghost" disabled title="Replace the grid with this page's auto-detection">⌖ Auto-detect</button>
+  <button id="resetRows" class="ghost" disabled title="Restore this page's auto-detected rows">↺ Reset rows</button>
+  <button id="redetect" class="ghost" disabled title="Re-detect this page's grid (replaces your columns)">⌖ Auto-detect</button>
   <button id="scrapeBtn" class="ghost" disabled>Scrape all pages</button>
-  <label class="chk" title="Each page keeps boss-pdf's own row detection. Untick to force your row lines onto every page."><input type="checkbox" id="autoRows" checked> auto rows per page</label>
   <label class="chk" title="The grid spans the whole table, so gaps between text lines come back as fully blank rows. Untick to keep them."><input type="checkbox" id="dropEmpty" checked> drop empty rows</label>
   <button id="excelBtn" class="primary" disabled>Excel (all pages)</button>
   <a class="btn ghost" href="/" style="text-decoration:none">← boss-pdf</a>
@@ -73,11 +73,13 @@
     <button id="zoomOut" class="ghost">–</button>
     <button id="zoomIn" class="ghost">+</button>
     <span class="spacer"></span>
+    <span id="rowState" class="pg">rows: auto-detected</span>
     <span class="msg" id="msg"></span>
   </div>
   <p class="hint">These are <b>boss-pdf's own grid lines</b> — exactly what “Make it Excel” used.
      Where it merged 2–3 columns into one, <b>add a line</b> to split them; drag to move, double-click to delete.
-     <b>blue = columns</b> (your fixes travel to every page), <b>green = rows</b> (each page keeps boss-pdf's own row detection).
+     <b>blue = columns</b> — global: calibrated once, applied to <b>every page</b>.
+     <b>green = rows</b> — <b>this page only</b>: auto-detected, and if you edit them your lines are remembered for that page (“Reset rows” restores auto). Other pages keep their own.
      Export re-runs boss-pdf's extraction with your corrected columns.</p>
   <div id="wrap"><div id="stage"><canvas id="pdfCanvas"></canvas></div></div>
   <div id="resWrap" style="display:none"><table class="res" id="resTable"></table></div>
@@ -88,8 +90,31 @@ pdfjsLib.GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 const $ = id => document.getElementById(id);
+// All line positions are normalized [0,1].
+//   columns    — GLOBAL: calibrated once, applied to every page.
+//   rows       — the CURRENT page's row lines (display).
+//   rowsByPage — only pages whose rows the user actually edited. Untouched
+//                pages keep boss-pdf's own per-page detection, so one page's
+//                rows are never forced onto another (rows drift page to page).
+//   pages      — cache of grids for pages you've actually opened (sparse).
 const S = { file:null, doc:null, page:1, numPages:1, scale:1.4,
-            columns:[], rows:[], drag:null };   // columns/rows are normalized [0,1]
+            pages:[], columns:[], rows:[], rowsByPage:{}, columnsEdited:false, drag:null };
+
+const pageGrid = n => S.pages[n-1] ||
+  {rows:[],columns:[],method:"none",score:0,n_cols:0,n_rows:0,found:false};
+
+const rowsEdited = p => Object.prototype.hasOwnProperty.call(S.rowsByPage, p);
+function markRowsEdited(){ S.rowsByPage[S.page] = S.rows.slice(); updateStatus(); }
+function updateStatus(){
+  const n = Object.keys(S.rowsByPage).length;
+  $("resetRows").disabled = !rowsEdited(S.page);
+  $("rowState").textContent = rowsEdited(S.page)
+    ? `rows: edited (this page)${n>1?` · ${n} pages edited`:""}`
+    : "rows: auto-detected";
+  const ok = S.columns.length >= 2;
+  $("scrapeBtn").disabled = !ok;
+  $("excelBtn").disabled = !ok;
+}
 
 // ---------- intake ----------
 $("pickBtn").onclick = ()=> $("fileInput").click();
@@ -109,8 +134,15 @@ async function load(file){
   S.numPages=S.doc.numPages; S.page=1;
   $("empty").style.display="none"; $("work").style.display="block";
   await render();
-  await detect();
-  ["addCol","addRow","redetect","scrapeBtn","excelBtn"].forEach(i=>$(i).disabled=false);
+  // Identify page 1's lines right away so you can start straight in.
+  try{
+    const g=await ensureGrid(1);
+    S.columns=(g.columns||[]).slice();
+    S.rows=(g.rows||[]).slice();
+    drawLines(); showPage();
+  }catch(e){ msg(e.message,"bad"); }
+  ["addCol","addRow","redetect"].forEach(i=>$(i).disabled=false);
+  updateStatus();   // enables scrape/excel only once we have >=2 column lines
 }
 
 // ---------- render page ----------
@@ -126,30 +158,41 @@ async function render(){
 }
 
 // ---------- detect (server) ----------
-// rowsOnly=true refreshes this page's row lines WITHOUT touching the user's
-// calibrated columns (used when paging with "auto rows per page" on).
-async function detect(rowsOnly){
-  msg(rowsOnly?"Detecting this page's rows…":"Detecting grid…","work");
-  const fd=new FormData(); fd.append("file",S.file,S.file.name); fd.append("page",String(S.page));
-  try{
-    const r=await fetch("/api/table/detect",{method:"POST",body:fd});
-    if(!r.ok){ const j=await r.json().catch(()=>({})); throw new Error(j.detail||"detect failed"); }
-    const d=await r.json();
-    if(!rowsOnly) S.columns=d.columns;
-    S.rows=d.rows; S.numPages=d.page_count;
-    drawLines();
-    msg(!d.found
-        ? "No engine found a table on this page — add column lines manually."
-        : `${d.n_cols} columns × ${d.n_rows} rows · via ${d.method} (score ${d.score}). `+
-          `Merged columns? Drop a line where the split belongs.`,
-        d.found?"ok":"bad");
-  }catch(e){ msg(e.message,"bad"); }
+// Detect a page ONLY when it's actually shown, then cache it. No up-front scan
+// of the whole document: pages you never open cost nothing, and the export
+// doesn't need them either — the backend auto-detects rows per page itself.
+async function ensureGrid(n){
+  if(S.pages[n-1]) return S.pages[n-1];           // already detected -> instant
+  msg(`Identifying lines on page ${n}…`,"work");
+  const fd=new FormData(); fd.append("file",S.file,S.file.name); fd.append("page",String(n));
+  const r=await fetch("/api/table/detect",{method:"POST",body:fd});
+  if(!r.ok){ const j=await r.json().catch(()=>({})); throw new Error(j.detail||"detect failed"); }
+  const d=await r.json();
+  S.numPages=d.page_count;
+  S.pages[n-1]=d;                                  // cache: revisits are instant
+  return d;
 }
+
+// Paging: cached pages are instant; a new page is identified once, then cached.
+// Never touches your calibrated columns.
 async function gotoPage(n){
   if(n<1||n>S.numPages) return;
   S.page=n; await render();
-  // Rows drift page to page — refresh them so what you see is what gets scraped.
-  if($("autoRows").checked) await detect(true);
+  let g;
+  try{ g=await ensureGrid(n); }catch(e){ msg(e.message,"bad"); return; }
+  S.rows = rowsEdited(n) ? S.rowsByPage[n].slice() : (g.rows||[]).slice();
+  drawLines(); updateStatus(); showPage();
+}
+function showPage(){
+  const g=pageGrid(S.page);
+  if(!g.found){ msg("No engine found a table on this page — add column lines manually.","bad"); return; }
+  // Report what is actually DRAWN (and therefore exported): the global columns
+  // and this page's row lines. Reporting the page's own detected column count
+  // would be a lie — you see and get the calibrated global columns.
+  const cols=Math.max(0,S.columns.length-1), rows=Math.max(0,S.rows.length-1);
+  const edited=rowsEdited(S.page)?" (your edited rows)":"";
+  const note=$("dropEmpty").checked?" · blank rows dropped on export":"";
+  msg(`page ${S.page}: ${cols} cols × ${rows} rows as drawn${edited} · rows via ${g.method}${note}`,"ok");
 }
 
 // ---------- line overlay (normalized -> displayed px) ----------
@@ -163,7 +206,7 @@ function drawLines(){
     d.title="drag to move · double-click to delete";
     d.innerHTML="<i></i>";
     d.addEventListener("mousedown",e=>{e.preventDefault();S.drag={axis:"col",i};});
-    d.addEventListener("dblclick",()=>{S.columns.splice(i,1);drawLines();});
+    d.addEventListener("dblclick",()=>{S.columns.splice(i,1);S.columnsEdited=true;drawLines();updateStatus();});
     stage.appendChild(d);
   });
   S.rows.forEach((y,i)=>{
@@ -172,17 +215,18 @@ function drawLines(){
     d.title="drag to move · double-click to delete";
     d.innerHTML="<i></i>";
     d.addEventListener("mousedown",e=>{e.preventDefault();S.drag={axis:"row",i};});
-    d.addEventListener("dblclick",()=>{S.rows.splice(i,1);drawLines();});
+    d.addEventListener("dblclick",()=>{S.rows.splice(i,1);markRowsEdited();drawLines();});
     stage.appendChild(d);
   });
 }
 $("stage").addEventListener("mousemove",e=>{
   if(!S.drag) return;
   const r=$("stage").getBoundingClientRect();
-  if(S.drag.axis==="col") S.columns[S.drag.i]=clamp((e.clientX-r.left)/r.width);
-  else                    S.rows[S.drag.i]=clamp((e.clientY-r.top)/r.height);
+  if(S.drag.axis==="col"){ S.columns[S.drag.i]=clamp((e.clientX-r.left)/r.width); S.columnsEdited=true; }
+  else                   { S.rows[S.drag.i]=clamp((e.clientY-r.top)/r.height); S.rowsByPage[S.page]=S.rows.slice(); }
   drawLines();
 });
+$("stage").addEventListener("mouseup",()=>updateStatus());
 ["mouseup","mouseleave"].forEach(ev=>$("stage").addEventListener(ev,()=>S.drag=null));
 const clamp=v=>Math.max(0,Math.min(1,v));
 
@@ -191,16 +235,32 @@ $("prev").onclick=()=>gotoPage(S.page-1);
 $("next").onclick=()=>gotoPage(S.page+1);
 $("zoomIn").onclick=()=>{ S.scale=Math.min(3,S.scale+0.2); render(); };
 $("zoomOut").onclick=()=>{ S.scale=Math.max(0.6,S.scale-0.2); render(); };
-$("redetect").onclick=()=>detect(false);
-$("addCol").onclick=()=>{ S.columns.push(0.5); S.columns.sort((a,b)=>a-b); drawLines(); };
-$("addRow").onclick=()=>{ S.rows.push(0.5); S.rows.sort((a,b)=>a-b); drawLines(); };
+$("redetect").onclick=()=>{
+  // Re-seed the global columns from THIS page's detected grid. That replaces
+  // your calibration everywhere, so don't throw it away silently.
+  if(S.columnsEdited && !confirm("Use this page's detected columns instead? This replaces your calibrated columns on every page.")) return;
+  S.columnsEdited=false;
+  S.columns=pageGrid(S.page).columns.slice();
+  delete S.rowsByPage[S.page];
+  S.rows=pageGrid(S.page).rows.slice();
+  drawLines(); updateStatus();
+  msg(`Columns re-seeded from page ${S.page}.`,"ok");
+};
+$("dropEmpty").onchange=()=>showPage();   // keep the "what you'll get" note honest
+$("resetRows").onclick=()=>{
+  delete S.rowsByPage[S.page];
+  S.rows=pageGrid(S.page).rows.slice();
+  drawLines(); updateStatus(); showPage();
+};
+$("addCol").onclick=()=>{ S.columns.push(0.5); S.columns.sort((a,b)=>a-b); S.columnsEdited=true; drawLines(); updateStatus(); };
+$("addRow").onclick=()=>{ S.rows.push(0.5); S.rows.sort((a,b)=>a-b); markRowsEdited(); drawLines(); };
 
 // ---------- scrape / excel ----------
 function body(){ const fd=new FormData();
   fd.append("file",S.file,S.file.name);
   fd.append("columns",JSON.stringify(S.columns));
-  fd.append("rows",JSON.stringify(S.rows));
-  fd.append("auto_rows",$("autoRows").checked?"true":"false");
+  // Only pages you actually edited; every other page keeps its own auto rows.
+  fd.append("rows_by_page",JSON.stringify(S.rowsByPage));
   fd.append("drop_empty",$("dropEmpty").checked?"true":"false");
   return fd; }
 

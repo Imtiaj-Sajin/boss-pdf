@@ -157,33 +157,45 @@ async def table_detect(file: UploadFile = File(...), page: int = Form(1)):
         raise HTTPException(status_code=500, detail=f"Detection failed: {e}") from e
 
 
-def _parse_lines(columns: str, rows: str) -> tuple[list[float], list[float]]:
+def _parse_columns(columns: str) -> list[float]:
     import json
     try:
         cols = [float(c) for c in (json.loads(columns) or [])]
-        rws = [float(r) for r in (json.loads(rows) or [])]
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid lines: {e}") from e
-    return cols, rws
+        raise HTTPException(status_code=400, detail=f"Invalid columns: {e}") from e
+    if len(cols) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Need at least 2 column lines (the table's left and right edges).")
+    return cols
+
+
+def _parse_rows_by_page(rows_by_page: str) -> dict[int, list[float]]:
+    """{"3": [0.1, 0.2]} -> {3: [0.1, 0.2]} — only pages the user actually
+    edited. Everything else keeps boss-pdf's own per-page row detection."""
+    import json
+    try:
+        raw = json.loads(rows_by_page or "{}") or {}
+        return {int(k): [float(v) for v in vals] for k, vals in raw.items() if vals}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid rows: {e}") from e
 
 
 @app.post("/api/table/scrape-all")
 async def table_scrape_all(file: UploadFile = File(...),
-                           columns: str = Form("[]"), rows: str = Form("[]"),
-                           auto_rows: Optional[str] = Form("true"),
+                           columns: str = Form("[]"),
+                           rows_by_page: str = Form("{}"),
                            drop_empty: Optional[str] = Form("true")):
-    """Preview: apply the calibrated grid to every page. Rows are page-prefixed."""
+    """Preview: apply the calibrated columns to every page. Rows are page-prefixed."""
     from .tablescrape import scrape_all
     pdf_bytes = await file.read()
     _validate_pdf(pdf_bytes)
-    cols, rws = _parse_lines(columns, rows)
-    auto = (auto_rows or "true").lower() in ("true", "1", "yes", "on")
+    cols = _parse_columns(columns)
+    rbp = _parse_rows_by_page(rows_by_page)
     drop = (drop_empty or "true").lower() in ("true", "1", "yes", "on")
-    if not cols:
-        raise HTTPException(status_code=400, detail="No column lines given.")
     try:
         from .tablescrape import preview_rows
-        pages = await run_in_threadpool(scrape_all, pdf_bytes, cols, rws, auto, drop)
+        pages = await run_in_threadpool(scrape_all, pdf_bytes, cols, rbp, drop)
     except Exception as e:
         log.exception("table scrape failed")
         raise HTTPException(status_code=500, detail=f"Scrape failed: {e}") from e
@@ -194,21 +206,19 @@ async def table_scrape_all(file: UploadFile = File(...),
 
 @app.post("/api/table/excel-all")
 async def table_excel_all(file: UploadFile = File(...),
-                          columns: str = Form("[]"), rows: str = Form("[]"),
-                          auto_rows: Optional[str] = Form("true"),
+                          columns: str = Form("[]"),
+                          rows_by_page: str = Form("{}"),
                           drop_empty: Optional[str] = Form("true")):
     """Whole PDF -> one Excel, built by the CORE converter using the user's
     corrected column lines. Output matches 'Make it Excel' plus the fix."""
     from .tablescrape import build_xlsx, scrape_all
     pdf_bytes = await file.read()
     _validate_pdf(pdf_bytes)
-    cols, rws = _parse_lines(columns, rows)
-    auto = (auto_rows or "true").lower() in ("true", "1", "yes", "on")
+    cols = _parse_columns(columns)
+    rbp = _parse_rows_by_page(rows_by_page)
     drop = (drop_empty or "true").lower() in ("true", "1", "yes", "on")
-    if not cols:
-        raise HTTPException(status_code=400, detail="No column lines given.")
     try:
-        pages = await run_in_threadpool(scrape_all, pdf_bytes, cols, rws, auto, drop)
+        pages = await run_in_threadpool(scrape_all, pdf_bytes, cols, rbp, drop)
         xlsx, total = await run_in_threadpool(build_xlsx, pages)
     except Exception as e:
         log.exception("table excel failed")
