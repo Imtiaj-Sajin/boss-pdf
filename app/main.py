@@ -48,6 +48,9 @@ app.add_middleware(
         "X-Boss-Log-Id",
         "X-Boss-Pages",
         "X-Boss-Usage-Id",
+        # Without these, a cross-origin fetch() can't read the table-scrape counts.
+        "X-Table-Rows",
+        "X-Table-Pages",
     ],
 )
 
@@ -138,6 +141,88 @@ def _ar_convert_sync(pdf_bytes: bytes) -> io.BytesIO:
             os.unlink(tmp)
         except OSError:
             pass
+
+
+@app.post("/api/table/detect")
+async def table_detect(file: UploadFile = File(...), page: int = Form(1)):
+    """Auto-detect a page's column/row separators. Lines come back normalized
+    to [0,1] so the browser can render at any scale and still line up."""
+    from .tablescrape import detect
+    pdf_bytes = await file.read()
+    _validate_pdf(pdf_bytes)
+    try:
+        return await run_in_threadpool(detect, pdf_bytes, int(page))
+    except Exception as e:
+        log.exception("table detect failed")
+        raise HTTPException(status_code=500, detail=f"Detection failed: {e}") from e
+
+
+def _parse_lines(columns: str, rows: str) -> tuple[list[float], list[float]]:
+    import json
+    try:
+        cols = [float(c) for c in (json.loads(columns) or [])]
+        rws = [float(r) for r in (json.loads(rows) or [])]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid lines: {e}") from e
+    return cols, rws
+
+
+@app.post("/api/table/scrape-all")
+async def table_scrape_all(file: UploadFile = File(...),
+                           columns: str = Form("[]"), rows: str = Form("[]"),
+                           auto_rows: Optional[str] = Form("true"),
+                           drop_empty: Optional[str] = Form("true")):
+    """Preview: apply the calibrated grid to every page. Rows are page-prefixed."""
+    from .tablescrape import scrape_all
+    pdf_bytes = await file.read()
+    _validate_pdf(pdf_bytes)
+    cols, rws = _parse_lines(columns, rows)
+    auto = (auto_rows or "true").lower() in ("true", "1", "yes", "on")
+    drop = (drop_empty or "true").lower() in ("true", "1", "yes", "on")
+    if not cols:
+        raise HTTPException(status_code=400, detail="No column lines given.")
+    try:
+        from .tablescrape import preview_rows
+        pages = await run_in_threadpool(scrape_all, pdf_bytes, cols, rws, auto, drop)
+    except Exception as e:
+        log.exception("table scrape failed")
+        raise HTTPException(status_code=500, detail=f"Scrape failed: {e}") from e
+    combined = preview_rows(pages)
+    total = sum(len(t) for p in pages for t in p.tables)
+    return {"rows": combined, "n_rows": total, "page_count": len(pages)}
+
+
+@app.post("/api/table/excel-all")
+async def table_excel_all(file: UploadFile = File(...),
+                          columns: str = Form("[]"), rows: str = Form("[]"),
+                          auto_rows: Optional[str] = Form("true"),
+                          drop_empty: Optional[str] = Form("true")):
+    """Whole PDF -> one Excel, built by the CORE converter using the user's
+    corrected column lines. Output matches 'Make it Excel' plus the fix."""
+    from .tablescrape import build_xlsx, scrape_all
+    pdf_bytes = await file.read()
+    _validate_pdf(pdf_bytes)
+    cols, rws = _parse_lines(columns, rows)
+    auto = (auto_rows or "true").lower() in ("true", "1", "yes", "on")
+    drop = (drop_empty or "true").lower() in ("true", "1", "yes", "on")
+    if not cols:
+        raise HTTPException(status_code=400, detail="No column lines given.")
+    try:
+        pages = await run_in_threadpool(scrape_all, pdf_bytes, cols, rws, auto, drop)
+        xlsx, total = await run_in_threadpool(build_xlsx, pages)
+    except Exception as e:
+        log.exception("table excel failed")
+        raise HTTPException(status_code=500, detail=f"Excel failed: {e}") from e
+    stem = os.path.splitext(_safe_filename(file.filename or "table"))[0]
+    return StreamingResponse(
+        io.BytesIO(xlsx),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{stem}.xlsx"',
+            "X-Table-Rows": str(total),
+            "X-Table-Pages": str(len(pages)),
+        },
+    )
 
 
 @app.post("/api/datapuller/export")
@@ -537,6 +622,10 @@ if WEB.exists():
     @app.get("/datapuller")
     def datapuller_page() -> FileResponse:
         return FileResponse(str(WEB / "datapuller.html"))
+
+    @app.get("/tablescrape")
+    def tablescrape_page() -> FileResponse:
+        return FileResponse(str(WEB / "tablescrape.html"))
 
     @app.get("/usage")
     def usage_page() -> FileResponse:

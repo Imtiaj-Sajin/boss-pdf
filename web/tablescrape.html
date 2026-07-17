@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Table Scrape · boss-pdf</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,'Segoe UI',Inter,sans-serif;background:#0d0e16;color:#f1eee7;margin:0}
+  header{display:flex;align-items:center;gap:14px;padding:13px 20px;border-bottom:1px solid #2a2d3b;background:#12131d;flex-wrap:wrap}
+  header h1{font-family:Georgia,serif;color:#c9a15a;margin:0;font-size:19px}
+  header .sub{color:#8a8576;font-size:12px;font-style:italic}
+  .spacer{flex:1}
+  button,.btn{font-family:inherit;border:0;border-radius:9px;padding:8px 13px;font-weight:600;font-size:13px;cursor:pointer}
+  .primary{background:#c9a15a;color:#1a1206}
+  .ghost{background:#1d1f2b;color:#e7e3d8;border:1px solid #333748}
+  button:disabled{opacity:.45;cursor:default}
+  main{padding:16px 20px}
+  .bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .pg{color:#b9b3a6;font-size:13px;min-width:92px;text-align:center}
+  .hint{color:#8a8576;font-size:12px;margin:6px 0}
+  .hint b{color:#c9a15a}
+  #wrap{overflow:auto;border:1px solid #2a2d3b;border-radius:10px;background:#1a1b26;padding:10px;display:flex;justify-content:center}
+  #stage{position:relative;line-height:0;box-shadow:0 6px 30px rgba(0,0,0,.5);background:#fff;user-select:none}
+  .colline{position:absolute;top:0;width:11px;cursor:ew-resize;z-index:2}
+  .colline i{position:absolute;left:5px;top:0;width:1.5px;height:100%;background:rgba(37,99,235,.9);display:block;pointer-events:none}
+  .rowline{position:absolute;left:0;height:11px;cursor:ns-resize;z-index:1}
+  .rowline i{position:absolute;top:5px;left:0;height:1.5px;width:100%;background:rgba(22,163,74,.85);display:block;pointer-events:none}
+  .drop{border:2px dashed #3a3d4e;border-radius:12px;padding:44px 20px;text-align:center;cursor:pointer;background:#0f1018;max-width:520px;margin:8vh auto}
+  .drop.hover{border-color:#c9a15a}
+  .drop b{color:#f1eee7}
+  input[type=file]{display:none}
+  .msg{font-size:13px;min-height:18px;margin:8px 0}
+  .ok{color:#5fdfb0}.bad{color:#e9806e}.work{color:#e0bd72}
+  table.res{border-collapse:collapse;font-size:12px;width:100%;background:#fbfaf6;color:#0d0e16}
+  table.res td{border:1px solid #d8d3c4;padding:4px 7px;vertical-align:top;white-space:pre-wrap}
+  table.res tr:first-child td{background:#e8dfc6;font-weight:700}
+  #resWrap{max-height:400px;overflow:auto;border:1px solid #2a2d3b;border-radius:10px;margin-top:8px}
+  label.chk{font-size:12px;color:#b9b3a6;display:inline-flex;align-items:center;gap:5px}
+</style></head><body>
+
+<header>
+  <h1>Table Scrape</h1>
+  <span class="sub">calibrate the grid once — it applies to every page</span>
+  <span class="spacer"></span>
+  <button id="addCol" class="ghost" disabled>+ Column line</button>
+  <button id="addRow" class="ghost" disabled>+ Row line</button>
+  <button id="redetect" class="ghost" disabled title="Replace the grid with this page's auto-detection">⌖ Auto-detect</button>
+  <button id="scrapeBtn" class="ghost" disabled>Scrape all pages</button>
+  <label class="chk" title="Each page keeps boss-pdf's own row detection. Untick to force your row lines onto every page."><input type="checkbox" id="autoRows" checked> auto rows per page</label>
+  <label class="chk" title="The grid spans the whole table, so gaps between text lines come back as fully blank rows. Untick to keep them."><input type="checkbox" id="dropEmpty" checked> drop empty rows</label>
+  <button id="excelBtn" class="primary" disabled>Excel (all pages)</button>
+  <a class="btn ghost" href="/" style="text-decoration:none">← boss-pdf</a>
+</header>
+
+<section id="empty">
+  <label class="drop" id="drop">
+    <div style="font-size:34px">📐</div>
+    <div><b>Choose a PDF</b> — or drop one here</div>
+    <div class="hint" style="margin-top:8px">We detect the table's grid, you nudge the lines, then the whole document exports.</div>
+    <input type="file" id="fileInput" accept="application/pdf,.pdf">
+    <div style="margin-top:14px"><button class="primary" type="button" id="pickBtn">Select PDF</button></div>
+    <div class="msg" id="emptyMsg"></div>
+  </label>
+</section>
+
+<main id="work" style="display:none">
+  <div class="bar">
+    <button id="prev" class="ghost">‹ Prev</button>
+    <span class="pg" id="pageInfo">page 1 / 1</span>
+    <button id="next" class="ghost">Next ›</button>
+    <span style="width:10px"></span>
+    <button id="zoomOut" class="ghost">–</button>
+    <button id="zoomIn" class="ghost">+</button>
+    <span class="spacer"></span>
+    <span class="msg" id="msg"></span>
+  </div>
+  <p class="hint">These are <b>boss-pdf's own grid lines</b> — exactly what “Make it Excel” used.
+     Where it merged 2–3 columns into one, <b>add a line</b> to split them; drag to move, double-click to delete.
+     <b>blue = columns</b> (your fixes travel to every page), <b>green = rows</b> (each page keeps boss-pdf's own row detection).
+     Export re-runs boss-pdf's extraction with your corrected columns.</p>
+  <div id="wrap"><div id="stage"><canvas id="pdfCanvas"></canvas></div></div>
+  <div id="resWrap" style="display:none"><table class="res" id="resTable"></table></div>
+</main>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const $ = id => document.getElementById(id);
+const S = { file:null, doc:null, page:1, numPages:1, scale:1.4,
+            columns:[], rows:[], drag:null };   // columns/rows are normalized [0,1]
+
+// ---------- intake ----------
+$("pickBtn").onclick = ()=> $("fileInput").click();
+$("fileInput").onchange = e => { if(e.target.files[0]) load(e.target.files[0]); };
+const drop=$("drop");
+drop.addEventListener("dragover",e=>{e.preventDefault();drop.classList.add("hover");});
+drop.addEventListener("dragleave",()=>drop.classList.remove("hover"));
+drop.addEventListener("drop",e=>{e.preventDefault();drop.classList.remove("hover");
+  const f=[...e.dataTransfer.files].find(f=>/\.pdf$/i.test(f.name)); if(f) load(f);
+  else { $("emptyMsg").className="msg bad"; $("emptyMsg").textContent="That's not a PDF."; }});
+
+async function load(file){
+  S.file=file;
+  $("emptyMsg").className="msg work"; $("emptyMsg").textContent="Reading…";
+  const buf=await file.arrayBuffer();
+  S.doc=await pdfjsLib.getDocument({data:buf.slice(0)}).promise;
+  S.numPages=S.doc.numPages; S.page=1;
+  $("empty").style.display="none"; $("work").style.display="block";
+  await render();
+  await detect();
+  ["addCol","addRow","redetect","scrapeBtn","excelBtn"].forEach(i=>$(i).disabled=false);
+}
+
+// ---------- render page ----------
+async function render(){
+  const page=await S.doc.getPage(S.page);
+  const vp=page.getViewport({scale:S.scale});
+  const c=$("pdfCanvas");
+  c.width=Math.floor(vp.width); c.height=Math.floor(vp.height);
+  $("stage").style.width=c.width+"px"; $("stage").style.height=c.height+"px";
+  await page.render({canvasContext:c.getContext("2d"),viewport:vp}).promise;
+  $("pageInfo").textContent=`page ${S.page} / ${S.numPages}`;
+  drawLines();
+}
+
+// ---------- detect (server) ----------
+// rowsOnly=true refreshes this page's row lines WITHOUT touching the user's
+// calibrated columns (used when paging with "auto rows per page" on).
+async function detect(rowsOnly){
+  msg(rowsOnly?"Detecting this page's rows…":"Detecting grid…","work");
+  const fd=new FormData(); fd.append("file",S.file,S.file.name); fd.append("page",String(S.page));
+  try{
+    const r=await fetch("/api/table/detect",{method:"POST",body:fd});
+    if(!r.ok){ const j=await r.json().catch(()=>({})); throw new Error(j.detail||"detect failed"); }
+    const d=await r.json();
+    if(!rowsOnly) S.columns=d.columns;
+    S.rows=d.rows; S.numPages=d.page_count;
+    drawLines();
+    msg(!d.found
+        ? "No engine found a table on this page — add column lines manually."
+        : `${d.n_cols} columns × ${d.n_rows} rows · via ${d.method} (score ${d.score}). `+
+          `Merged columns? Drop a line where the split belongs.`,
+        d.found?"ok":"bad");
+  }catch(e){ msg(e.message,"bad"); }
+}
+async function gotoPage(n){
+  if(n<1||n>S.numPages) return;
+  S.page=n; await render();
+  // Rows drift page to page — refresh them so what you see is what gets scraped.
+  if($("autoRows").checked) await detect(true);
+}
+
+// ---------- line overlay (normalized -> displayed px) ----------
+function drawLines(){
+  const stage=$("stage");
+  stage.querySelectorAll(".colline,.rowline").forEach(n=>n.remove());
+  const W=$("pdfCanvas").width, H=$("pdfCanvas").height;
+  S.columns.forEach((x,i)=>{
+    const d=document.createElement("div"); d.className="colline";
+    d.style.left=(x*W-5)+"px"; d.style.height=H+"px";
+    d.title="drag to move · double-click to delete";
+    d.innerHTML="<i></i>";
+    d.addEventListener("mousedown",e=>{e.preventDefault();S.drag={axis:"col",i};});
+    d.addEventListener("dblclick",()=>{S.columns.splice(i,1);drawLines();});
+    stage.appendChild(d);
+  });
+  S.rows.forEach((y,i)=>{
+    const d=document.createElement("div"); d.className="rowline";
+    d.style.top=(y*H-5)+"px"; d.style.width=W+"px";
+    d.title="drag to move · double-click to delete";
+    d.innerHTML="<i></i>";
+    d.addEventListener("mousedown",e=>{e.preventDefault();S.drag={axis:"row",i};});
+    d.addEventListener("dblclick",()=>{S.rows.splice(i,1);drawLines();});
+    stage.appendChild(d);
+  });
+}
+$("stage").addEventListener("mousemove",e=>{
+  if(!S.drag) return;
+  const r=$("stage").getBoundingClientRect();
+  if(S.drag.axis==="col") S.columns[S.drag.i]=clamp((e.clientX-r.left)/r.width);
+  else                    S.rows[S.drag.i]=clamp((e.clientY-r.top)/r.height);
+  drawLines();
+});
+["mouseup","mouseleave"].forEach(ev=>$("stage").addEventListener(ev,()=>S.drag=null));
+const clamp=v=>Math.max(0,Math.min(1,v));
+
+// ---------- controls ----------
+$("prev").onclick=()=>gotoPage(S.page-1);
+$("next").onclick=()=>gotoPage(S.page+1);
+$("zoomIn").onclick=()=>{ S.scale=Math.min(3,S.scale+0.2); render(); };
+$("zoomOut").onclick=()=>{ S.scale=Math.max(0.6,S.scale-0.2); render(); };
+$("redetect").onclick=()=>detect(false);
+$("addCol").onclick=()=>{ S.columns.push(0.5); S.columns.sort((a,b)=>a-b); drawLines(); };
+$("addRow").onclick=()=>{ S.rows.push(0.5); S.rows.sort((a,b)=>a-b); drawLines(); };
+
+// ---------- scrape / excel ----------
+function body(){ const fd=new FormData();
+  fd.append("file",S.file,S.file.name);
+  fd.append("columns",JSON.stringify(S.columns));
+  fd.append("rows",JSON.stringify(S.rows));
+  fd.append("auto_rows",$("autoRows").checked?"true":"false");
+  fd.append("drop_empty",$("dropEmpty").checked?"true":"false");
+  return fd; }
+
+$("scrapeBtn").onclick=async()=>{
+  msg("Scraping every page…","work"); $("scrapeBtn").disabled=true;
+  try{
+    const r=await fetch("/api/table/scrape-all",{method:"POST",body:body()});
+    if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.detail||"scrape failed");}
+    const j=await r.json();
+    const t=$("resTable"); t.innerHTML="";
+    j.rows.slice(0,400).forEach(row=>{
+      const tr=document.createElement("tr");
+      row.forEach(c=>{const td=document.createElement("td");td.textContent=c;tr.appendChild(td);});
+      t.appendChild(tr);
+    });
+    $("resWrap").style.display="block";
+    msg(`Scraped ${j.n_rows} rows across ${j.page_count} page(s)${j.n_rows>400?" — showing first 400":""}.`,"ok");
+  }catch(e){ msg(e.message,"bad"); }
+  $("scrapeBtn").disabled=false;
+};
+
+$("excelBtn").onclick=async()=>{
+  msg("Building Excel…","work"); $("excelBtn").disabled=true;
+  const fd=body();
+  try{
+    const r=await fetch("/api/table/excel-all",{method:"POST",body:fd});
+    if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.detail||"excel failed");}
+    const n=r.headers.get("X-Table-Rows"), p=r.headers.get("X-Table-Pages");
+    const blob=await r.blob();
+    const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+    a.download=S.file.name.replace(/\.pdf$/i,"")+".xlsx"; a.click(); URL.revokeObjectURL(a.href);
+    msg(`Excel downloaded — ${n} rows from ${p} page(s).`,"ok");
+  }catch(e){ msg(e.message,"bad"); }
+  $("excelBtn").disabled=false;
+};
+
+function msg(t,k){ const m=$("msg"); m.className="msg "+(k||""); m.textContent=t; }
+</script>
+</body></html>
