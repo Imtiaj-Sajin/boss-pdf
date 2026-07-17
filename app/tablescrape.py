@@ -80,16 +80,29 @@ def _camelot_rich(t):
         return []
 
 
-def _winning_tables(page):
-    """Return (tables, settings) for the BEST strategy in boss-pdf's ladder.
+def _is_real_grid(xs: list[float], ys: list[float]) -> bool:
+    """A real table has at least 2 columns AND 2 rows of cells (>=3 cut lines
+    on each axis). A lone rule — a 'Totals' bar, an underline, a page border —
+    yields a 1-column or 1-row "table", which is not a table."""
+    return len(xs) >= 3 and len(ys) >= 3
 
-    The core converter stops at the first strategy that returns *any* table.
-    That misfires on pages carrying a stray rule (e.g. a 'Totals' bar): the
-    lines/lines strategy finds a junk 1x2 table, wins by default, and the real
-    table the text/text strategy would have found is never tried. So we score
-    every strategy by the content it actually extracts and keep the best.
+
+def _winning_tables(page):
+    """Walk boss-pdf's ladder IN ORDER; take the first strategy giving a real grid.
+
+    Order matters and must be respected: `lines` comes first because when a
+    table is genuinely BORDERED, those ruled lines ARE its structure. Deriving
+    columns from text spacing instead would ignore the borders the document
+    already tells us about, and tends to over-segment. So a bordered table wins
+    on its own rules — we never let a text-derived grid outvote real borders.
+
+    Core's bug is that it takes the first strategy returning *any* table, so a
+    page carrying a stray rule (that 'Totals' bar) hands lines/lines a
+    degenerate 1x2 "table" which wins by default and buries the real one. The
+    fix is not to score-maximise across strategies (that would let text/text
+    beat genuine borders) — it's to skip *degenerate* results and fall through.
     """
-    best_score, best_found, best_settings = 0.0, [], None
+    fallback = ([], None)
     for settings in _TABLE_SETTINGS_OPTIONS:
         try:
             found = page.find_tables(table_settings=settings) or []
@@ -98,15 +111,12 @@ def _winning_tables(page):
             continue
         if not found:
             continue
-        score = 0.0
-        for t in found:
-            try:
-                score += _score_table(_extract_rich_table_from_pdfplumber(page, t))
-            except Exception:
-                continue
-        if score > best_score:
-            best_score, best_found, best_settings = score, found, settings
-    return best_found, best_settings
+        xs, ys = _grid_of(_biggest(found))
+        if _is_real_grid(xs, ys):
+            return found, settings          # real grid — borders respected first
+        if not fallback[0]:
+            fallback = (found, settings)    # keep as last resort
+    return fallback
 
 
 def _grid_of(table) -> tuple[list[float], list[float]]:
@@ -122,6 +132,32 @@ def _grid_of(table) -> tuple[list[float], list[float]]:
 def _biggest(tables):
     """The table covering the most area — the real one when stray bits appear."""
     return max(tables, key=lambda t: (t.bbox[2] - t.bbox[0]) * (t.bbox[3] - t.bbox[1]))
+
+
+def _clean_row_cuts(page, table) -> list[float]:
+    """One cut BETWEEN text rows, instead of one above and one below each.
+
+    pdfplumber's text strategy puts a cut at both the top and the bottom of
+    every text line. The strip left over between two lines therefore becomes its
+    own band with nothing in it: 46 real rows come back as 91 (46 text + 45
+    phantom empties). Collapsing each gap to a single cut at its midpoint gives
+    exactly one row per text line — no empties to filter out afterwards, and the
+    lines you see are the lines you get.
+    """
+    chars = page.chars
+    bands = []
+    for row in table.rows:
+        top, bottom = float(row.bbox[1]), float(row.bbox[3])
+        has_text = any(top <= (c["top"] + c["bottom"]) / 2 < bottom for c in chars)
+        bands.append((top, bottom, has_text))
+    text_bands = [(t, b) for t, b, has in bands if has]
+    if not text_bands:
+        return []
+    cuts = [text_bands[0][0]]
+    for i in range(len(text_bands) - 1):
+        cuts.append((text_bands[i][1] + text_bands[i + 1][0]) / 2.0)   # midpoint of the gap
+    cuts.append(text_bands[-1][1])
+    return cuts
 
 
 def _best_grid(pdf_path: str, page, page_num: int) -> tuple[str, float, list[float], list[float]]:
@@ -144,7 +180,8 @@ def _best_grid(pdf_path: str, page, page_num: int) -> tuple[str, float, list[flo
             score = _score_table(_extract_rich_table_from_pdfplumber(page, t))
         except Exception:
             score = 0.0
-        xs, ys = _grid_of(t)
+        xs, _raw_ys = _grid_of(t)
+        ys = _clean_row_cuts(page, t) or _raw_ys   # one cut between rows, no phantoms
         if score > best[1]:
             best = ("pdfplumber", score, xs, ys)
 
@@ -253,9 +290,17 @@ def _page_result(page, page_num: int, columns: list[float],
                                 "intersection_tolerance": 5})
     settings["vertical_strategy"] = "explicit"
     settings["explicit_vertical_lines"] = sorted(c * w for c in columns)
+
+    # Rows: your edits for THIS page if you made any, else this page's own
+    # cleaned cuts (one between text rows). Either way they go in explicitly,
+    # so the export can't drift from the lines you were shown.
     if rows:
+        ys_pt = sorted(r * h for r in rows)
+    else:
+        ys_pt = _clean_row_cuts(page, _biggest(_tables)) if _tables else []
+    if ys_pt:
         settings["horizontal_strategy"] = "explicit"
-        settings["explicit_horizontal_lines"] = sorted(r * h for r in rows)
+        settings["explicit_horizontal_lines"] = ys_pt
 
     try:
         found = page.find_tables(table_settings=settings) or []
