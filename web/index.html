@@ -7,11 +7,11 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;0,9..144,800;1,9..144,600;1,9..144,700;1,9..144,800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=13" />
+  <link rel="stylesheet" href="/static/style.css?v=14" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
           crossorigin="anonymous"
           referrerpolicy="no-referrer"></script>
-  <script src="/static/auth.js?v=13"></script>
+  <script src="/static/auth.js?v=14"></script>
   <script>if (!BossAuth.requireAuth()) { /* redirected */ }</script>
 </head>
 <body>
@@ -74,13 +74,30 @@
         <span id="batchCount" class="fsize"></span>
       </div>
       <h2 class="boss-line">A folder, huh? The boss likes efficiency.</h2>
-      <p class="boss-sub">Convert every PDF at once, or send them to the Data Puller to pull the same fields from each.</p>
+      <p class="boss-sub">Pick the assignment — you'll set it up on the first PDF, then apply the same treatment to every file in the folder.</p>
 
-      <div id="batchList" class="section-list" style="max-height:260px;overflow:auto"></div>
+      <div class="tools">
+        <button class="tool-card" data-batch-tool="convert" type="button">
+          <div class="tool-emoji">📊</div>
+          <div class="tool-title">Make it Excel</div>
+          <div class="tool-desc">Choose pages on the first PDF, then convert every PDF the same way — one ZIP of spreadsheets.</div>
+        </button>
+        <button class="tool-card" data-batch-tool="split" type="button">
+          <div class="tool-emoji">✂️</div>
+          <div class="tool-title">Slice it up</div>
+          <div class="tool-desc">Set the page ranges once, then slice every PDF the same way — one ZIP of sliced PDFs.</div>
+        </button>
+        <button class="tool-card" data-batch-tool="puller" type="button">
+          <div class="tool-emoji">🎯</div>
+          <div class="tool-title">Data Puller</div>
+          <div class="tool-desc">Pull the same fields out of every PDF in the folder.</div>
+        </button>
+      </div>
+
+      <div id="batchList" class="section-list" style="max-height:200px;overflow:auto;margin-top:14px"></div>
 
       <div class="row-actions">
-        <button id="batchConvertBtn" class="primary" type="button">Convert all → ZIP</button>
-        <button id="batchPullerBtn" class="ghost" type="button">🎯 Data Puller</button>
+        <button id="batchConvertBtn" class="ghost" type="button" title="Convert every PDF in full, no page picking">⚡ Convert all pages → ZIP</button>
         <button id="batchBack" class="ghost" type="button">← Back</button>
       </div>
       <p class="msg" id="batchMsg" style="margin-top:10px;min-height:18px"></p>
@@ -262,7 +279,7 @@
     <div class="zoom-label" id="zoomLabel"></div>
   </div>
 
-  <script src="/static/app.js?v=13"></script>
+  <script src="/static/app.js?v=14"></script>
   <script>
   // ---- Folder upload: batch convert + Data Puller handoff ----
   (function(){
@@ -283,7 +300,10 @@
       bmsg("");
       hide(dropzone); show(batch);
     }
-    $("pickFolderBtn").addEventListener("click", ()=> $("folderInput").click());
+    // stopPropagation matters: this button sits INSIDE the dropzone, whose own
+    // click handler opens the single-FILE picker — without it you'd get the
+    // file dialog instead of the folder dialog.
+    $("pickFolderBtn").addEventListener("click", e=>{ e.stopPropagation(); $("folderInput").click(); });
     $("folderInput").addEventListener("change", e=>{
       loadBatch([...e.target.files].filter(f => /\.pdf$/i.test(f.name)));
     });
@@ -320,13 +340,13 @@
       });
     }
 
-    // Convert all -> ZIP (uses the auth-gated batch endpoint)
+    // Shortcut: convert every PDF in full (no page picking) -> ZIP.
     $("batchConvertBtn").addEventListener("click", async ()=>{
       if(!batchFiles.length) return;
-      $("batchConvertBtn").disabled = true; $("batchPullerBtn").disabled = true;
+      const btn = $("batchConvertBtn");
+      btn.disabled = true;
       bmsg(`Converting ${batchFiles.length} PDFs… this can take a while.`, "work");
       const fd = new FormData();
-      const forceEl = $("forceOcr"); if(forceEl && forceEl.checked) fd.append("force_ocr","true");
       batchFiles.forEach(f=> fd.append("files", f, f.name));
       try{
         const res = await BossAuth.authFetch("/api/convert-batch", { method:"POST", body:fd });
@@ -336,16 +356,33 @@
         a.download="boss-pdf-batch.zip"; a.click(); URL.revokeObjectURL(a.href);
         bmsg("Done — boss-pdf-batch.zip downloaded.", "ok");
       }catch(err){ bmsg(err.message || "Batch convert failed.", "bad"); }
-      $("batchConvertBtn").disabled = false; $("batchPullerBtn").disabled = false;
+      btn.disabled = false;
     });
 
-    // Data Puller -> stash files in IndexedDB, hand off to /datapuller
-    $("batchPullerBtn").addEventListener("click", async ()=>{
-      if(!batchFiles.length) return;
-      bmsg("Opening Data Puller…", "work");
-      try{ await writeHandoff(batchFiles); }catch(_){}
-      location.href = "/datapuller";
+    // Tool cards: Excel / Split hand the whole list to app.js, which opens the
+    // NORMAL single-file editor on the first PDF and swaps its action button
+    // for "Apply to all N PDFs". Data Puller keeps the IndexedDB handoff.
+    document.querySelectorAll("[data-batch-tool]").forEach(btn=>{
+      btn.addEventListener("click", async ()=>{
+        if(!batchFiles.length){ bmsg("No PDFs selected.", "bad"); return; }
+        const tool = btn.dataset.batchTool;
+        if(tool === "puller"){
+          bmsg("Opening Data Puller…", "work");
+          try{ await writeHandoff(batchFiles); }catch(_){}
+          location.href = "/datapuller";
+          return;
+        }
+        bmsg("Loading the first PDF so you can set it up…", "work");
+        try{
+          await window.BossBatch.start(batchFiles, tool);
+          hide(batch);
+          bmsg("");
+        }catch(err){ bmsg(err.message || "Could not open that PDF.", "bad"); }
+      });
     });
+
+    // app.js calls this when the user backs out of a batch editor.
+    window.BossBatchReturn = ()=>{ hide(dropzone); show(batch); bmsg(""); };
 
     function writeHandoff(files){
       return new Promise((res,rej)=>{

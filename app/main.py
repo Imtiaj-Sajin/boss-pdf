@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -287,6 +288,26 @@ async def datapuller_export(files: list[UploadFile] = File(...),
     )
 
 
+def _lenient_page_set(spec: str, total: int) -> Optional[set[int]]:
+    """Parse a page spec like "1,3,5-9" but CLAMP to the file's page count
+    instead of erroring — batch mode applies ONE spec (built on the first
+    PDF) to every file, and the others may be shorter/longer. Returns None
+    when nothing in the spec fits this file."""
+    out: set[int] = set()
+    for part in re.split(r"[\s,]+", (spec or "").strip()):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            continue
+        a = int(m.group(1))
+        b = int(m.group(2) or a)
+        lo, hi = min(a, b), max(a, b)
+        for p in range(max(1, lo), min(hi, total) + 1):
+            out.add(p)
+    return out or None
+
+
 @app.post("/api/convert-batch")
 async def convert_batch(files: list[UploadFile] = File(...),
                         pages: Optional[str] = Form(None),
@@ -295,8 +316,10 @@ async def convert_batch(files: list[UploadFile] = File(...),
                         current_user: CurrentUser = Depends(get_current_user),
                         db: Session = Depends(get_db)):
     """Convert a whole folder of PDFs in one shot; returns a ZIP of .xlsx files.
-    Same conversion as /api/convert, looped per file."""
+    Same conversion as /api/convert, looped per file. `pages` (optional) is a
+    page spec applied to EVERY file, clamped per file's page count."""
     force_flag = (force_ocr or "").lower() in ("true", "1", "yes", "on")
+    want_pages = pages and pages.strip().lower() not in ("", "all")
     zip_buf = io.BytesIO()
     n_ok = 0
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -306,9 +329,19 @@ async def convert_batch(files: list[UploadFile] = File(...),
             pdf_bytes = await uf.read()
             if pdf_bytes[:5] != b"%PDF-" or len(pdf_bytes) > MAX_BYTES:
                 continue
+            page_set: Optional[set[int]] = None
+            if want_pages:
+                try:
+                    total = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
+                except Exception:
+                    continue
+                page_set = _lenient_page_set(pages, total)
+                if page_set is None:
+                    # The chosen pages don't exist in this file at all.
+                    continue
             try:
                 result = await run_in_threadpool(
-                    convert_pdf_bytes, pdf_bytes, None, uf.filename, force_flag,
+                    convert_pdf_bytes, pdf_bytes, page_set, uf.filename, force_flag,
                 )
             except Exception:
                 log.exception("batch convert failed for %s", uf.filename)
@@ -611,6 +644,90 @@ async def split(file: UploadFile = File(...),
         "X-Boss-Usage-Id": str(usage_id) if usage_id else "",
     }
     return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
+
+
+@app.post("/api/split-batch")
+async def split_batch(files: list[UploadFile] = File(...),
+                      ranges: str = Form(...),
+                      x_session_id: Optional[str] = Header(None),
+                      current_user: CurrentUser = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    """Apply ONE set of page ranges to a whole folder of PDFs.
+
+    `ranges` is the same JSON array of page-specs /api/split takes. Every file
+    gets the same slicing, clamped to its own page count, and the parts land in
+    one ZIP under a per-file folder. Files the spec can't touch at all are
+    skipped rather than failing the whole batch.
+    """
+    uploaded_at = datetime.now(timezone.utc)
+    try:
+        spec_list = [str(s) for s in json.loads(ranges)]
+        if not spec_list:
+            raise ValueError("ranges must be a non-empty list")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid ranges: {e}") from e
+
+    zip_buf = io.BytesIO()
+    n_ok = 0
+    total_parts = 0
+    total_pages = 0
+    done_names: list[str] = []
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for uf in files:
+            if not uf.filename or not uf.filename.lower().endswith(".pdf"):
+                continue
+            pdf_bytes = await uf.read()
+            if pdf_bytes[:5] != b"%PDF-" or len(pdf_bytes) > MAX_BYTES:
+                continue
+            try:
+                reader = PdfReader(io.BytesIO(pdf_bytes))
+                if reader.is_encrypted:
+                    try:
+                        reader.decrypt("")
+                    except Exception:
+                        continue
+                total = len(reader.pages)
+            except Exception:
+                log.exception("batch split could not read %s", uf.filename)
+                continue
+
+            stem = os.path.splitext(_safe_filename(uf.filename))[0]
+            wrote_any = False
+            for i, spec in enumerate(spec_list, start=1):
+                page_set = _lenient_page_set(spec, total)
+                if not page_set:
+                    continue          # this range is past the end of this file
+                idx = sorted(p - 1 for p in page_set)
+                try:
+                    part = _extract_pages_to_pdf(reader, idx)
+                except Exception:
+                    log.exception("batch split failed on %s part %s", uf.filename, spec)
+                    continue
+                label = spec.replace(",", "_")
+                name = (f"{stem}/{stem}_part{i}_p{label}.pdf"
+                        if len(spec_list) > 1 else f"{stem}_p{label}.pdf")
+                zf.writestr(name, part)
+                wrote_any = True
+                total_parts += 1
+                total_pages += len(idx)
+            if wrote_any:
+                n_ok += 1
+                done_names.append(uf.filename)
+
+    if n_ok == 0:
+        raise HTTPException(status_code=400, detail="No PDFs could be split with those ranges.")
+    zip_buf.seek(0)
+    usage_mod.log_usage(
+        db, user=current_user, session_id=x_session_id,
+        operation="split", batch_name=f"{n_ok} PDFs (batch)",
+        file_names=done_names, files_processed=n_ok,
+        pages_processed=total_pages, split_parts=total_parts,
+        uploaded_at=uploaded_at, finished_at=datetime.now(timezone.utc),
+    )
+    return StreamingResponse(
+        zip_buf, media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="boss-pdf-split-batch.zip"'},
+    )
 
 
 # Serve the static frontend at /

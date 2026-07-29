@@ -125,6 +125,14 @@ let pageCount = 0;
 let pdfDoc = null;
 let pdfDocFile = null;
 
+// ---------- Batch (folder) state ----------
+// When a folder is picked, the SAME converter/splitter UI is configured on the
+// first PDF; the primary button then applies that config to every file and
+// downloads one ZIP. batchFiles is empty in normal single-file mode.
+let batchFiles = [];
+const inBatch = () => batchFiles.length > 0;
+const batchLabel = () => `${batchFiles.length} PDF${batchFiles.length === 1 ? "" : "s"}`;
+
 const convSelected = new Set();
 let sections = []; // [{ from, to, color }]
 
@@ -151,6 +159,7 @@ function resetAll() {
   progressBar.style.width = "0%";
   progressBar.classList.remove("indeterminate");
   fileInput.value = "";
+  batchFiles = [];
   currentFile = null;
   pageCount = 0;
   pdfDoc = null;
@@ -162,6 +171,10 @@ function resetAll() {
   convThumbs.innerHTML = "";
   splitThumbs.innerHTML = "";
   sectionListEl.innerHTML = "";
+  // Batch card + dropzone live outside ALL_CARDS — restore the entry screen.
+  const batchCard = document.getElementById("batch");
+  if (batchCard) hide(batchCard);
+  show(dropzone);
 }
 
 function showError(message) {
@@ -242,6 +255,42 @@ async function handleFile(file) {
   }
 }
 
+// ============================================================
+// Batch entry point — called from the folder card in index.html.
+// Loads the FIRST PDF into the normal editor; the action button then applies
+// that same config to every file in the folder.
+// ============================================================
+window.BossBatch = {
+  async start(files, tool) {
+    const first = files[0];
+    const form = new FormData();
+    form.append("file", first);
+    const res = await BossAuth.authFetch("/api/pdf-info", { method: "POST", body: form });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      throw new Error(j.detail || "Could not read the first PDF.");
+    }
+    const info = await res.json();
+    batchFiles = files;
+    currentFile = first;
+    pdfDoc = null; pdfDocFile = null;
+    pageCount = info.pages || 0;
+    if (pageCount < 1) throw new Error("That PDF has no pages.");
+    if (tool === "split") openSplitter();
+    else openConverter();
+  },
+};
+
+// Leaving a batch editor goes back to the folder card, not the chooser.
+function leaveEditor() {
+  if (inBatch() && window.BossBatchReturn) {
+    ALL_CARDS.forEach(hide);
+    window.BossBatchReturn();
+  } else {
+    showChooser();
+  }
+}
+
 // ---------- Step 2: chooser ----------
 function showChooser() {
   chooserName.textContent = currentFile.name;
@@ -316,8 +365,11 @@ async function renderThumbnails(file, container, onTileClick, decorate) {
 // Converter
 // ============================================================
 async function openConverter() {
-  convName.textContent = currentFile.name;
-  convPages.textContent = `${pageCount} page${pageCount === 1 ? "" : "s"}`;
+  convName.textContent = inBatch() ? `${currentFile.name}  ·  +${batchFiles.length - 1} more` : currentFile.name;
+  convPages.textContent = inBatch()
+    ? `setting up on the first of ${batchLabel()}`
+    : `${pageCount} page${pageCount === 1 ? "" : "s"}`;
+  convertBtn.textContent = inBatch() ? `Apply to all ${batchLabel()} → ZIP` : "Make it Excel";
   convSelected.clear();
   for (let i = 1; i <= pageCount; i++) convSelected.add(i);
   convFrom.value = 1; convFrom.max = pageCount;
@@ -397,7 +449,7 @@ function syncConvTiles() {
   });
 }
 
-convBack.addEventListener("click", showChooser);
+convBack.addEventListener("click", leaveEditor);
 convertBtn.addEventListener("click", () => {
   if (convSelected.size === 0) {
     showError("The boss needs at least one page, kid.");
@@ -406,8 +458,24 @@ convertBtn.addEventListener("click", () => {
   const spec = convSelected.size === pageCount ? "all" : compressPages(convSelected);
   const forceOcrEl = document.getElementById("forceOcr");
   const forceOcr = !!(forceOcrEl && forceOcrEl.checked);
-  runConvert(currentFile, spec, forceOcr);
+  if (inBatch()) runConvertBatch(spec, forceOcr);
+  else runConvert(currentFile, spec, forceOcr);
 });
+
+// ---- Batch: same page selection + OCR flag applied to every PDF ----
+function runConvertBatch(pageSpec, forceOcr) {
+  const form = new FormData();
+  batchFiles.forEach(f => form.append("files", f, f.name));
+  if (pageSpec && pageSpec !== "all") form.append("pages", pageSpec);
+  if (forceOcr) form.append("force_ocr", "true");
+  runBatchJob({
+    url: "/api/convert-batch",
+    form,
+    zipName: "boss-pdf-batch.zip",
+    working: `The boss is converting ${batchLabel()}${pageSpec !== "all" ? ` (pages ${pageSpec})` : ""}…`,
+    doneMsg: `${batchLabel()} converted${pageSpec !== "all" ? ` · pages ${pageSpec} from each` : ""}. Your ZIP of spreadsheets is ready.`,
+  });
+}
 
 function runConvert(file, pageSpec, forceOcr) {
   fileNameEl.textContent = file.name;
@@ -455,6 +523,7 @@ function runConvert(file, pageSpec, forceOcr) {
       const url = URL.createObjectURL(xlsxBlob);
       downloadLink.href = url;
       downloadLink.download = outName;
+      downloadLink.textContent = "Download .xlsx";   // batch mode swaps this to .zip
 
       // engine badge
       engineBadge.classList.remove("native", "ocr");
@@ -508,8 +577,11 @@ function runConvert(file, pageSpec, forceOcr) {
 // ============================================================
 
 async function openSplitter() {
-  splitName.textContent = currentFile.name;
-  splitPages.textContent = `${pageCount} page${pageCount === 1 ? "" : "s"}`;
+  splitName.textContent = inBatch() ? `${currentFile.name}  ·  +${batchFiles.length - 1} more` : currentFile.name;
+  splitPages.textContent = inBatch()
+    ? `setting up on the first of ${batchLabel()}`
+    : `${pageCount} page${pageCount === 1 ? "" : "s"}`;
+  splitBtn.textContent = inBatch() ? `Apply to all ${batchLabel()} → ZIP` : "Slice it up";
   // default: ONE section, page 1 → last page
   sections = [{ from: 1, to: pageCount, color: SECTION_COLORS[0] }];
   pickedPages.clear();
@@ -543,6 +615,12 @@ function setSplitMode(mode) {
     splitModeHint.textContent = pick
       ? "Click pages in the preview to build one PDF — in click order, like 1, 5, 9, 12."
       : "Set the page range for each new PDF. Add more rows for more files.";
+    if (inBatch()) {
+      // Ranges are clamped per file server-side, so a folder of mixed page
+      // counts still produces output instead of erroring.
+      splitModeHint.textContent +=
+        ` The same ranges apply to all ${batchLabel()} — pages past a shorter file's end are simply skipped.`;
+    }
   }
   if (splitPreviewHint) {
     splitPreviewHint.textContent = pick
@@ -756,7 +834,7 @@ autoSplitBtn.addEventListener("click", () => {
   onSectionsChanged();
 });
 
-splitBack.addEventListener("click", showChooser);
+splitBack.addEventListener("click", leaveEditor);
 
 splitBtn.addEventListener("click", () => {
   if (splitMode === "pick") {
@@ -766,7 +844,8 @@ splitBtn.addEventListener("click", () => {
     }
     const arr = [...pickedPages].sort((a, b) => a - b);
     // One output PDF with all picked pages — e.g. "1,5,9,12".
-    runSplit(currentFile, [arr.join(",")]);
+    if (inBatch()) runSplitBatch([arr.join(",")]);
+    else runSplit(currentFile, [arr.join(",")]);
     return;
   }
 
@@ -779,8 +858,78 @@ splitBtn.addEventListener("click", () => {
     }
   }
   const specs = sections.map(s => s.from === s.to ? `${s.from}` : `${s.from}-${s.to}`);
-  runSplit(currentFile, specs);
+  if (inBatch()) runSplitBatch(specs);
+  else runSplit(currentFile, specs);
 });
+
+// ---- Batch: same ranges applied to every PDF, one ZIP back ----
+function runSplitBatch(specs) {
+  const form = new FormData();
+  batchFiles.forEach(f => form.append("files", f, f.name));
+  form.append("ranges", JSON.stringify(specs));
+  const partWord = specs.length === 1 ? "slice" : `${specs.length} slices`;
+  runBatchJob({
+    url: "/api/split-batch",
+    form,
+    zipName: "boss-pdf-split-batch.zip",
+    working: `The boss is slicing ${batchLabel()}…`,
+    doneMsg: `${batchLabel()} sliced — ${partWord} from each (pages ${specs.join(", ")}). Your ZIP is ready.`,
+  });
+}
+
+// Shared uploader for both batch jobs: progress bar, ZIP download, result card.
+// Ranges/pages that overrun a shorter PDF are clamped server-side, so a mixed
+// folder still produces output instead of failing.
+function runBatchJob({ url, form, zipName, working, doneMsg }) {
+  fileNameEl.textContent = batchLabel();
+  fileSizeEl.textContent = fmtSize(batchFiles.reduce((s, f) => s + f.size, 0));
+  progressBar.style.width = "0%";
+  progressBar.classList.remove("indeterminate");
+  statusMsg.textContent = "Uploading the folder…";
+  showOnly(statusEl);
+
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", url);
+  xhr.responseType = "blob";
+  BossAuth.applyAuthHeaders(xhr);
+
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) {
+      progressBar.style.width = Math.round((e.loaded / e.total) * 40) + "%";
+    }
+  };
+  xhr.upload.onload = () => {
+    statusMsg.textContent = working + " This can take a while — the boss is thorough.";
+    progressBar.classList.add("indeterminate");
+  };
+  xhr.onload = () => {
+    progressBar.classList.remove("indeterminate");
+    progressBar.style.width = "100%";
+    if (xhr.status === 200) {
+      const urlObj = URL.createObjectURL(xhr.response);
+      downloadLink.href = urlObj;
+      downloadLink.download = zipName;
+      downloadLink.textContent = "Download .zip";
+      resultMsg.textContent = doneMsg;
+      engineBadgeRow.classList.add("hidden");
+      logDlBtn.classList.add("hidden");
+      previewBtn.classList.add("hidden");
+      showOnly(resultEl);
+      downloadLink.click();
+    } else {
+      const reader = new FileReader();
+      reader.onload = () => {
+        let msg = "Batch job failed.";
+        try { const j = JSON.parse(reader.result); if (j && j.detail) msg = j.detail; } catch (_) {}
+        showError(msg);
+      };
+      reader.onerror = () => showError("Batch job failed.");
+      reader.readAsText(xhr.response);
+    }
+  };
+  xhr.onerror = () => showError("Network error. Is the server running?");
+  xhr.send(form);
+}
 
 function runSplit(file, specs) {
   fileNameEl.textContent = file.name;
