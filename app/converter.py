@@ -278,16 +278,6 @@ def _extract_page_title_lines(page, table_bboxes: list[tuple]) -> list[str]:
     return [ln for ln in lines if ln]
 
 
-def _is_degenerate(t: RichTable) -> bool:
-    """A 'table' with fewer than 2 rows or 2 columns isn't a table.
-
-    Stray page furniture — a rule under a totals line, a shading rectangle, a
-    page border — makes the `lines` strategy report 2x1 slivers. Those must not
-    count as a find, or they win the ladder by default and bury the real table.
-    """
-    return len(t) < 2 or len(t[0]) < 2
-
-
 def _extract_pdfplumber(pdf_path: str, pages: Optional[set[int]] = None) -> list[PageResult]:
     results: list[PageResult] = []
     with pdfplumber.open(pdf_path) as pdf:
@@ -296,38 +286,22 @@ def _extract_pdfplumber(pdf_path: str, pages: Optional[set[int]] = None) -> list
                 continue
             tables: list[RichTable] = []
             table_bboxes: list[tuple] = []
-            # Walk the strategy ladder in order — `lines` first, so a genuinely
-            # bordered table is read from its own rules. Take the first strategy
-            # that yields a REAL grid; a strategy that only produces degenerate
-            # slivers is kept as a last resort and we keep looking. (Without
-            # this, a ledger whose only ruling is a few shading rects returns
-            # six 2x1 shards and the real 44x14 table is never extracted.)
-            fallback: Optional[tuple[list[RichTable], list[tuple]]] = None
             for settings in _TABLE_SETTINGS_OPTIONS:
                 try:
                     found = page.find_tables(table_settings=settings) or []
                 except Exception as e:
                     logger.warning("find_tables p%d %s: %s", i, settings, e)
                     found = []
-                cand: list[RichTable] = []
-                cand_bboxes: list[tuple] = []
                 for t in found:
                     try:
                         rt = _extract_rich_table_from_pdfplumber(page, t)
                         if rt:
-                            cand.append(rt)
-                            cand_bboxes.append(t.bbox)
+                            tables.append(rt)
+                            table_bboxes.append(t.bbox)
                     except Exception as e:
                         logger.warning("rich extract p%d failed: %s", i, e)
-                if not cand:
-                    continue
-                if any(not _is_degenerate(t) for t in cand):
-                    tables, table_bboxes = cand, cand_bboxes
+                if tables:
                     break
-                if fallback is None:
-                    fallback = (cand, cand_bboxes)
-            if not tables and fallback is not None:
-                tables, table_bboxes = fallback
 
             title_lines = _extract_page_title_lines(page, table_bboxes)
             score = sum(_score_table(t) for t in tables)
