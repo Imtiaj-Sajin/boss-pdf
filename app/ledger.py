@@ -31,10 +31,16 @@ logger = logging.getLogger(__name__)
 # --- fixed x-bands of the summary block (PDF points) ---
 _SUM_CODE_X = 92        # charge code sits left of this; description right of it
 _SUM_DESC_END = 200     # description ends before the first money column
-# right edges of the money columns, in order
+# The summary's money columns are right-aligned; these are their right edges,
+# in printed order, matching the header row:
+#   Mo. Rep Charges | Beg Balance | Charges | Cash Receipts
+#   | N/C Credits | Refunds | End Balance | Sec Dep Bal
 _SUM_MONEY_RIGHT = [272, 339, 402, 465, 528, 591, 654, 717]
-_CHARGES_COL = 2        # 0-based: Mo.Rep(0), Beg Balance(1), CHARGES(2)
-_CHARGES_RIGHT = _SUM_MONEY_RIGHT[_CHARGES_COL]
+_MONEY_FIELDS = ["mo_rep", "beg_bal", "charges", "receipts",
+                 "nc_credits", "refunds", "end_bal", "sec_dep"]
+_MONEY_HEADERS = ["Mo. Rep Charges", "Beg Balance", "Charges", "Cash Receipts",
+                  "N/C Credits", "Refunds", "End Balance", "Sec Dep Bal"]
+_CHARGES_RIGHT = _SUM_MONEY_RIGHT[2]   # used to detect a summary row
 
 _DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/\d{2,4}")
 _NUM_RE = re.compile(r"^\(?-?[\d,]+\.\d{2}\)?$")
@@ -82,11 +88,23 @@ def _after_label(text, label):
 
 class Row:
     __slots__ = ("suite", "lease", "tenant", "status", "contact",
-                 "term_from", "term_to", "sqft", "code", "desc", "charges", "page")
+                 "term_from", "term_to", "sqft", "code", "desc", "page",
+                 *_MONEY_FIELDS)
 
     def __init__(self, **kw):
         for s in self.__slots__:
             setattr(self, s, kw.get(s, ""))
+
+
+def _money_row(line) -> dict:
+    """Every money column on a summary line, keyed by field name. A column the
+    row doesn't print (charge rows carry no Sec Dep Bal) stays blank."""
+    out = {}
+    for field, right in zip(_MONEY_FIELDS, _SUM_MONEY_RIGHT):
+        v = _money_at(line, right)
+        if v is not None:
+            out[field] = v
+    return out
 
 
 def parse(pdf_path: str) -> list[Row]:
@@ -102,20 +120,20 @@ def parse(pdf_path: str) -> list[Row]:
 
                 # ---- summary row: a short CODE in the far-left band ----
                 if x0 < _SUM_CODE_X and _CODE_RE.match(first) and len(line) > 2:
-                    charges = _money_at(line, _CHARGES_RIGHT)
-                    if charges is not None:
+                    money = _money_row(line)
+                    if "charges" in money:
                         out.append(Row(
                             page=pno, code=first,
                             desc=_between(line, _SUM_CODE_X, _SUM_DESC_END),
-                            charges=charges,
+                            **money,
                         ))
                         continue
 
                 # ---- summary total row ----
-                if first == "Total:" :
-                    v = _money_at(line, _CHARGES_RIGHT)
-                    if v is not None:
-                        out.append(Row(page=pno, code="Total:", charges=v))
+                if first == "Total:":
+                    money = _money_row(line)
+                    if money:
+                        out.append(Row(page=pno, code="Total:", **money))
                     continue
 
                 # ---- tenant line 2: 'Lease Term:' + 'Square Feet:' ----
@@ -150,9 +168,9 @@ def parse(pdf_path: str) -> list[Row]:
     return out
 
 
-HEADERS = ["Page", "Suite", "Lease", "Tenant Name", "Status", "Contact",
-           "Term From", "Term To", "Square Feet", "Charge Code",
-           "Charge Description", "Charges"]
+HEADERS = (["Page", "Suite", "Lease", "Tenant Name", "Status", "Contact",
+            "Term From", "Term To", "Square Feet", "Charge Code",
+            "Charge Description"] + _MONEY_HEADERS)
 _FILL = PatternFill(start_color="FF305496", end_color="FF305496", fill_type="solid")
 
 
@@ -181,12 +199,17 @@ def build_xlsx(rows: list[Row]) -> tuple[bytes, int]:
         ws.cell(row=r, column=9, value=row.sqft)
         ws.cell(row=r, column=10, value=row.code)
         ws.cell(row=r, column=11, value=row.desc)
-        if row.charges != "":
-            c = ws.cell(row=r, column=12, value=row.charges)
+        bold = row.code == "Total:"
+        for j, field in enumerate(_MONEY_FIELDS):
+            v = getattr(row, field)
+            if v == "":
+                continue
+            c = ws.cell(row=r, column=12 + j, value=v)
             c.number_format = "#,##0.00"
-            if row.code == "Total:":
+            if bold:
                 c.font = Font(bold=True)
-                ws.cell(row=r, column=10).font = Font(bold=True)
+        if bold:
+            ws.cell(row=r, column=10).font = Font(bold=True)
         r += 1
 
     for col in range(1, len(HEADERS) + 1):
