@@ -308,18 +308,33 @@ def _lenient_page_set(spec: str, total: int) -> Optional[set[int]]:
     return out or None
 
 
+def _parse_per_file(per_file: Optional[str]) -> dict:
+    """Parse the optional per-file override JSON ({filename: spec}). Bad JSON is
+    ignored (falls back to the shared spec) rather than failing the batch."""
+    if not per_file:
+        return {}
+    try:
+        data = json.loads(per_file)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 @app.post("/api/convert-batch")
 async def convert_batch(files: list[UploadFile] = File(...),
                         pages: Optional[str] = Form(None),
+                        per_file: Optional[str] = Form(None),
                         force_ocr: Optional[str] = Form(None),
                         x_session_id: Optional[str] = Header(None),
                         current_user: CurrentUser = Depends(get_current_user),
                         db: Session = Depends(get_db)):
     """Convert a whole folder of PDFs in one shot; returns a ZIP of .xlsx files.
-    Same conversion as /api/convert, looped per file. `pages` (optional) is a
-    page spec applied to EVERY file, clamped per file's page count."""
+    Same conversion as /api/convert, looped per file. `pages` (optional) is the
+    shared page spec applied to every file; `per_file` (optional JSON
+    {filename: pagespec}) overrides individual files. Specs are clamped per
+    file's page count."""
     force_flag = (force_ocr or "").lower() in ("true", "1", "yes", "on")
-    want_pages = pages and pages.strip().lower() not in ("", "all")
+    per_map = _parse_per_file(per_file)
     zip_buf = io.BytesIO()
     n_ok = 0
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -329,13 +344,15 @@ async def convert_batch(files: list[UploadFile] = File(...),
             pdf_bytes = await uf.read()
             if pdf_bytes[:5] != b"%PDF-" or len(pdf_bytes) > MAX_BYTES:
                 continue
+            spec = per_map.get(uf.filename, pages)   # per-file override, else shared
+            want_pages = bool(spec) and str(spec).strip().lower() not in ("", "all")
             page_set: Optional[set[int]] = None
             if want_pages:
                 try:
                     total = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
                 except Exception:
                     continue
-                page_set = _lenient_page_set(pages, total)
+                page_set = _lenient_page_set(str(spec), total)
                 if page_set is None:
                     # The chosen pages don't exist in this file at all.
                     continue
@@ -697,15 +714,17 @@ async def split(file: UploadFile = File(...),
 @app.post("/api/split-batch")
 async def split_batch(files: list[UploadFile] = File(...),
                       ranges: str = Form(...),
+                      per_file: Optional[str] = Form(None),
                       x_session_id: Optional[str] = Header(None),
                       current_user: CurrentUser = Depends(get_current_user),
                       db: Session = Depends(get_db)):
-    """Apply ONE set of page ranges to a whole folder of PDFs.
+    """Split a whole folder of PDFs.
 
-    `ranges` is the same JSON array of page-specs /api/split takes. Every file
-    gets the same slicing, clamped to its own page count, and the parts land in
-    one ZIP under a per-file folder. Files the spec can't touch at all are
-    skipped rather than failing the whole batch.
+    `ranges` is the shared JSON array of page-specs (same as /api/split) applied
+    to every file. `per_file` (optional JSON {filename: [spec, ...]}) overrides
+    individual files with their own ranges. Everything is clamped to each file's
+    page count; files a spec can't touch at all are skipped rather than failing
+    the whole batch.
     """
     uploaded_at = datetime.now(timezone.utc)
     try:
@@ -714,6 +733,7 @@ async def split_batch(files: list[UploadFile] = File(...),
             raise ValueError("ranges must be a non-empty list")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid ranges: {e}") from e
+    per_map = _parse_per_file(per_file)
 
     zip_buf = io.BytesIO()
     n_ok = 0
@@ -740,8 +760,11 @@ async def split_batch(files: list[UploadFile] = File(...),
                 continue
 
             stem = os.path.splitext(_safe_filename(uf.filename))[0]
+            # This file's own ranges if overridden, else the shared ranges.
+            raw = per_map.get(uf.filename)
+            file_specs = [str(s) for s in raw] if isinstance(raw, list) and raw else spec_list
             wrote_any = False
-            for i, spec in enumerate(spec_list, start=1):
+            for i, spec in enumerate(file_specs, start=1):
                 page_set = _lenient_page_set(spec, total)
                 if not page_set:
                     continue          # this range is past the end of this file
@@ -753,7 +776,7 @@ async def split_batch(files: list[UploadFile] = File(...),
                     continue
                 label = spec.replace(",", "_")
                 name = (f"{stem}/{stem}_part{i}_p{label}.pdf"
-                        if len(spec_list) > 1 else f"{stem}_p{label}.pdf")
+                        if len(file_specs) > 1 else f"{stem}_p{label}.pdf")
                 zf.writestr(name, part)
                 wrote_any = True
                 total_parts += 1

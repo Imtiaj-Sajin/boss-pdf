@@ -1365,3 +1365,21 @@ footer {
   .usage-main { padding: 0 18px; }
 }
 
+
+/* ---- Batch file bar (per-PDF customization in convert/split editors) ---- */
+.batch-bar{ display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  padding:10px 0 4px; border-bottom:1px solid rgba(255,255,255,.06); margin-bottom:8px; }
+.batch-bar .bb-label{ font-size:11px; text-transform:uppercase; letter-spacing:.5px;
+  color:var(--muted,#8a8576); margin-right:2px; }
+.batch-bar .bb-files{ display:flex; gap:6px; overflow-x:auto; flex:1; padding-bottom:2px; }
+.bb-chip{ display:inline-flex; align-items:center; gap:6px; white-space:nowrap;
+  padding:6px 10px; border-radius:8px; border:1px solid #333748; background:#1d1f2b;
+  color:#d9d5c8; font-size:12px; cursor:pointer; max-width:190px; }
+.bb-chip .nm{ overflow:hidden; text-overflow:ellipsis; }
+.bb-chip.active{ border-color:var(--gold,#c9a15a); background:#26283a; color:#f1eee7; }
+.bb-chip .tag{ font-size:9.5px; text-transform:uppercase; letter-spacing:.4px;
+  background:#3a2f12; color:#e0bd72; border-radius:10px; padding:1px 6px; }
+.bb-chip.active .tag{ background:#c9a15a; color:#1a1206; }
+.bb-apply{ font-size:11px; padding:5px 10px; border-radius:8px; border:1px solid #333748;
+  background:#1d1f2b; color:#e7e3d8; cursor:pointer; white-space:nowrap; }
+.bb-apply:hover{ border-color:var(--gold,#c9a15a); }

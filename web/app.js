@@ -133,6 +133,14 @@ let batchFiles = [];
 const inBatch = () => batchFiles.length > 0;
 const batchLabel = () => `${batchFiles.length} PDF${batchFiles.length === 1 ? "" : "s"}`;
 
+// ---------- Per-PDF batch config ----------
+// The editor edits ONE file at a time (activeIdx). batchCfg[i] holds that file's
+// spec so you can customize any PDF; files you never touch fall back to the
+// shared config (file 0's). batchTool is "convert" | "split".
+let batchTool = "convert";
+let activeIdx = 0;
+let batchCfg = [];   // per file: {pages} for convert, {sections,mode,picked} for split
+
 const convSelected = new Set();
 let sections = []; // [{ from, to, color }]
 
@@ -168,6 +176,8 @@ function resetAll() {
   sections = [];
   pickedPages.clear();
   splitMode = "ranges";
+  batchCfg = [];
+  activeIdx = 0;
   convThumbs.innerHTML = "";
   splitThumbs.innerHTML = "";
   sectionListEl.innerHTML = "";
@@ -276,6 +286,9 @@ window.BossBatch = {
     pdfDoc = null; pdfDocFile = null;
     pageCount = info.pages || 0;
     if (pageCount < 1) throw new Error("That PDF has no pages.");
+    batchTool = tool === "split" ? "split" : "convert";
+    activeIdx = 0;
+    batchCfg = files.map(() => null);   // null = not yet customized (uses shared)
     if (tool === "split") openSplitter();
     else openConverter();
   },
@@ -289,6 +302,96 @@ function leaveEditor() {
   } else {
     showChooser();
   }
+}
+
+// ============================================================
+// Per-PDF batch customization (sidebar of files + per-file specs)
+// All of this is guarded so any failure degrades to the old
+// "one config applied to all" behaviour rather than breaking the batch.
+// ============================================================
+
+function saveActiveCfg() {
+  if (!inBatch()) return;
+  try {
+    if (batchTool === "convert") {
+      batchCfg[activeIdx] = { pages: convSelected.size === pageCount ? "all" : compressPages(convSelected) };
+    } else {
+      batchCfg[activeIdx] = {
+        sections: sections.map(s => ({ from: s.from, to: s.to })),
+        mode: splitMode,
+        picked: [...pickedPages],
+      };
+    }
+  } catch (_) {}
+}
+
+function specsFromCfg(c) {
+  if (!c) return [];
+  if (c.mode === "pick") { const s = compressPages(new Set(c.picked || [])); return s ? [s] : []; }
+  return (c.sections || []).map(s => (s.from === s.to ? `${s.from}` : `${s.from}-${s.to}`));
+}
+function cfgSpecString(i) {
+  const c = batchCfg[i];
+  if (!c) return "";
+  if (batchTool === "convert") return "c:" + (c.pages || "all");
+  return "s:" + (c.mode === "pick"
+    ? "P:" + (c.picked || []).slice().sort((a, b) => a - b).join(",")
+    : (c.sections || []).map(s => `${s.from}-${s.to}`).join("|"));
+}
+function isCustomized(i) {
+  if (i === 0 || !batchCfg[i]) return false;
+  return cfgSpecString(i) !== cfgSpecString(0);
+}
+
+async function switchBatchFile(idx) {
+  if (!inBatch() || idx === activeIdx || idx < 0 || idx >= batchFiles.length) return;
+  saveActiveCfg();
+  activeIdx = idx;
+  currentFile = batchFiles[idx];
+  try { pageCount = (await ensurePdfDoc(currentFile)).numPages; } catch (_) {}
+  if (batchTool === "split") openSplitter(); else openConverter();
+}
+
+function applyToAllFiles() {
+  saveActiveCfg();
+  const mine = batchCfg[activeIdx];
+  if (!mine) return;
+  batchCfg = batchFiles.map(() => JSON.parse(JSON.stringify(mine)));
+  renderBatchBar();
+}
+
+function buildPerFileMap() {
+  saveActiveCfg();
+  const per = {};
+  for (let i = 1; i < batchFiles.length; i++) {
+    if (!isCustomized(i)) continue;
+    per[batchFiles[i].name] = (batchTool === "convert")
+      ? (batchCfg[i].pages || "all")
+      : specsFromCfg(batchCfg[i]);
+  }
+  return per;
+}
+
+function renderBatchBar() {
+  const bar = document.getElementById(batchTool === "split" ? "splitBatchBar" : "convBatchBar");
+  const other = document.getElementById(batchTool === "split" ? "convBatchBar" : "splitBatchBar");
+  if (other) hide(other);
+  if (!bar) return;
+  if (!inBatch() || batchFiles.length < 2) { hide(bar); return; }
+  show(bar);
+  const esc = s => (s || "").replace(/[&<>"]/g, "");
+  const chips = batchFiles.map((f, i) => {
+    const tag = isCustomized(i) ? `<span class="tag">custom</span>` : "";
+    const cls = "bb-chip" + (i === activeIdx ? " active" : "");
+    return `<button type="button" class="${cls}" data-bidx="${i}" title="${esc(f.name)}"><span class="nm">${esc(f.name)}</span>${tag}</button>`;
+  }).join("");
+  bar.innerHTML =
+    `<span class="bb-label">PDFs</span><div class="bb-files">${chips}</div>` +
+    `<button type="button" class="bb-apply" id="bbApply">Apply this one to all</button>`;
+  bar.querySelectorAll(".bb-chip").forEach(el =>
+    el.addEventListener("click", () => switchBatchFile(parseInt(el.dataset.bidx, 10))));
+  const ap = document.getElementById("bbApply");
+  if (ap) ap.addEventListener("click", applyToAllFiles);
 }
 
 // ---------- Step 2: chooser ----------
@@ -365,18 +468,24 @@ async function renderThumbnails(file, container, onTileClick, decorate) {
 // Converter
 // ============================================================
 async function openConverter() {
-  convName.textContent = inBatch() ? `${currentFile.name}  ·  +${batchFiles.length - 1} more` : currentFile.name;
+  convName.textContent = currentFile.name;
   convPages.textContent = inBatch()
-    ? `setting up on the first of ${batchLabel()}`
+    ? `PDF ${activeIdx + 1} of ${batchLabel()} · ${pageCount} page${pageCount === 1 ? "" : "s"}`
     : `${pageCount} page${pageCount === 1 ? "" : "s"}`;
   convertBtn.textContent = inBatch() ? `Apply to all ${batchLabel()} → ZIP` : "Make it Excel";
   convSelected.clear();
-  for (let i = 1; i <= pageCount; i++) convSelected.add(i);
+  const ccfg = inBatch() ? batchCfg[activeIdx] : null;
+  if (ccfg && ccfg.pages && ccfg.pages !== "all") {
+    parsePagesSpec(ccfg.pages, pageCount).forEach(n => convSelected.add(n));
+  } else {
+    for (let i = 1; i <= pageCount; i++) convSelected.add(i);
+  }
   convFrom.value = 1; convFrom.max = pageCount;
   convTo.value = pageCount; convTo.max = pageCount;
   const forceOcrEl = document.getElementById("forceOcr");
   if (forceOcrEl) forceOcrEl.checked = false;
   showOnly(converterEl);
+  renderBatchBar();
   updateConvSummary();
 
   await renderThumbnails(currentFile, convThumbs,
@@ -462,18 +571,24 @@ convertBtn.addEventListener("click", () => {
   else runConvert(currentFile, spec, forceOcr);
 });
 
-// ---- Batch: same page selection + OCR flag applied to every PDF ----
-function runConvertBatch(pageSpec, forceOcr) {
+// ---- Batch: file 0 is the shared spec; per_file overrides customized PDFs ----
+function runConvertBatch(_activeSpec, forceOcr) {
+  saveActiveCfg();
+  const shared = (batchCfg[0] && batchCfg[0].pages) || "all";
+  const per = buildPerFileMap();
+  const nCustom = Object.keys(per).length;
   const form = new FormData();
   batchFiles.forEach(f => form.append("files", f, f.name));
-  if (pageSpec && pageSpec !== "all") form.append("pages", pageSpec);
+  if (shared && shared !== "all") form.append("pages", shared);
+  if (nCustom) form.append("per_file", JSON.stringify(per));
   if (forceOcr) form.append("force_ocr", "true");
+  const extra = nCustom ? ` · ${nCustom} customized` : (shared !== "all" ? ` · pages ${shared} each` : "");
   runBatchJob({
     url: "/api/convert-batch",
     form,
     zipName: "boss-pdf-batch.zip",
-    working: `The boss is converting ${batchLabel()}${pageSpec !== "all" ? ` (pages ${pageSpec})` : ""}…`,
-    doneMsg: `${batchLabel()} converted${pageSpec !== "all" ? ` · pages ${pageSpec} from each` : ""}. Your ZIP of spreadsheets is ready.`,
+    working: `The boss is converting ${batchLabel()}${extra}…`,
+    doneMsg: `${batchLabel()} converted${extra}. Your ZIP of spreadsheets is ready.`,
   });
 }
 
@@ -577,16 +692,25 @@ function runConvert(file, pageSpec, forceOcr) {
 // ============================================================
 
 async function openSplitter() {
-  splitName.textContent = inBatch() ? `${currentFile.name}  ·  +${batchFiles.length - 1} more` : currentFile.name;
+  splitName.textContent = currentFile.name;
   splitPages.textContent = inBatch()
-    ? `setting up on the first of ${batchLabel()}`
+    ? `PDF ${activeIdx + 1} of ${batchLabel()} · ${pageCount} page${pageCount === 1 ? "" : "s"}`
     : `${pageCount} page${pageCount === 1 ? "" : "s"}`;
   splitBtn.textContent = inBatch() ? `Apply to all ${batchLabel()} → ZIP` : "Slice it up";
-  // default: ONE section, page 1 → last page
-  sections = [{ from: 1, to: pageCount, color: SECTION_COLORS[0] }];
-  pickedPages.clear();
-  setSplitMode("ranges");
+  // Load this file's saved ranges if any, else default to ONE section 1 → last.
+  const scfg = inBatch() ? batchCfg[activeIdx] : null;
+  if (scfg && scfg.sections && scfg.sections.length) {
+    sections = scfg.sections.map((s, i) => ({ from: s.from, to: s.to, color: SECTION_COLORS[i % SECTION_COLORS.length] }));
+    pickedPages.clear();
+    (scfg.picked || []).forEach(p => pickedPages.add(p));
+    setSplitMode(scfg.mode || "ranges");
+  } else {
+    sections = [{ from: 1, to: pageCount, color: SECTION_COLORS[0] }];
+    pickedPages.clear();
+    setSplitMode("ranges");
+  }
   showOnly(splitterEl);
+  renderBatchBar();
   renderSections();
   updateSplitSummary();
   updatePickQueue();
@@ -862,18 +986,25 @@ splitBtn.addEventListener("click", () => {
   else runSplit(currentFile, specs);
 });
 
-// ---- Batch: same ranges applied to every PDF, one ZIP back ----
+// ---- Batch: file 0 is the shared ranges; per_file overrides customized PDFs ----
 function runSplitBatch(specs) {
+  saveActiveCfg();
+  const shared = (batchCfg[0] ? specsFromCfg(batchCfg[0]) : specs);
+  const sharedSpecs = shared.length ? shared : specs;
+  const per = buildPerFileMap();
+  const nCustom = Object.keys(per).length;
   const form = new FormData();
   batchFiles.forEach(f => form.append("files", f, f.name));
-  form.append("ranges", JSON.stringify(specs));
-  const partWord = specs.length === 1 ? "slice" : `${specs.length} slices`;
+  form.append("ranges", JSON.stringify(sharedSpecs));
+  if (nCustom) form.append("per_file", JSON.stringify(per));
+  const partWord = sharedSpecs.length === 1 ? "slice" : `${sharedSpecs.length} slices`;
+  const extra = nCustom ? ` · ${nCustom} customized` : "";
   runBatchJob({
     url: "/api/split-batch",
     form,
     zipName: "boss-pdf-split-batch.zip",
     working: `The boss is slicing ${batchLabel()}…`,
-    doneMsg: `${batchLabel()} sliced — ${partWord} from each (pages ${specs.join(", ")}). Your ZIP is ready.`,
+    doneMsg: `${batchLabel()} sliced — ${partWord} each${extra}. Your ZIP is ready.`,
   });
 }
 
