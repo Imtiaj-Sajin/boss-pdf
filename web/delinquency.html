@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aged Delinquency · boss-pdf</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,'Segoe UI',Inter,sans-serif;background:#0d0e16;color:#f1eee7;
+       display:grid;place-items:center;min-height:100vh;margin:0}
+  .card{background:#171823;border:1px solid #2a2d3b;border-radius:16px;padding:34px 38px;max-width:560px;width:92%}
+  h1{font-family:Georgia,serif;color:#c9a15a;margin:0 0 6px;font-size:24px}
+  p.sub{color:#9a9485;margin:0 0 22px;font-style:italic}
+  .drop{border:2px dashed #3a3d4e;border-radius:12px;padding:34px;text-align:center;cursor:pointer;
+        transition:.15s;background:#0f1018}
+  .drop.hover{border-color:#c9a15a;background:#14151f}
+  .drop b{color:#f1eee7}
+  .drop .big{font-size:32px;margin-bottom:6px}
+  input[type=file]{display:none}
+  .row{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
+  button{font-family:inherit;border:0;border-radius:10px;padding:11px 15px;font-weight:700;font-size:14px;cursor:pointer}
+  .primary{background:#c9a15a;color:#1a1206}
+  .ghost{background:#1d1f2b;color:#e7e3d8;border:1px solid #333748}
+  button:disabled{opacity:.45;cursor:default}
+  .files{margin-top:14px;max-height:200px;overflow:auto;font-size:12.5px;color:#b9b3a6}
+  .files div{padding:3px 0;border-bottom:1px solid #20222e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .msg{margin-top:14px;min-height:20px;font-size:14px}
+  .ok{color:#5fdfb0}.bad{color:#e9806e}.work{color:#e0bd72}
+  .foot{margin-top:16px;font-size:12px;color:#7a7585}
+  a.back{color:#c9a15a;text-decoration:none;font-size:13px}
+</style></head><body>
+<div class="card">
+  <h1>Aged Delinquency → Excel</h1>
+  <p class="sub">Drop a folder of MRI "Aged Delinquencies" PDFs (one per property). Get one combined workbook.</p>
+
+  <label class="drop" id="drop">
+    <div class="big">📁</div>
+    <div><b>Choose a folder</b> — or drop PDFs here</div>
+    <div class="foot">Property name is read from each file's name.</div>
+    <input type="file" id="folder" webkitdirectory directory multiple>
+    <input type="file" id="filesInput" accept="application/pdf,.pdf" multiple>
+  </label>
+
+  <div class="row">
+    <button class="ghost" type="button" id="pickFolder">Select folder</button>
+    <button class="ghost" type="button" id="pickFiles">Select files</button>
+    <button class="primary" type="button" id="go" disabled>Build Excel</button>
+  </div>
+
+  <div class="files" id="fileList"></div>
+  <div class="msg" id="msg"></div>
+  <div class="foot"><a class="back" href="/">← boss-pdf</a></div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let picked=[];
+function msg(t,k){ const m=$("msg"); m.className="msg "+(k||""); m.textContent=t; }
+
+function setFiles(list){
+  const pdfs=[...list].filter(f=>/\.pdf$/i.test(f.name));
+  if(!pdfs.length){ msg("No PDFs found.","bad"); return; }
+  pdfs.sort((a,b)=>a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+  picked=pdfs;
+  $("fileList").innerHTML=pdfs.map(f=>`<div>${f.name.replace(/[&<>]/g,'')}</div>`).join("");
+  $("go").disabled=false;
+  msg(`${pdfs.length} PDF${pdfs.length>1?"s":""} ready.`,"ok");
+}
+
+$("pickFolder").onclick=()=>$("folder").click();
+$("pickFiles").onclick=()=>$("filesInput").click();
+$("folder").onchange=e=>setFiles(e.target.files);
+$("filesInput").onchange=e=>setFiles(e.target.files);
+
+const drop=$("drop");
+drop.addEventListener("dragover",e=>{e.preventDefault();drop.classList.add("hover");});
+drop.addEventListener("dragleave",()=>drop.classList.remove("hover"));
+drop.addEventListener("drop",async e=>{
+  e.preventDefault();drop.classList.remove("hover");
+  msg("Reading folder…","work");
+  setFiles(await filesFromDataTransfer(e.dataTransfer));
+});
+async function filesFromDataTransfer(dt){
+  const items=dt.items?[...dt.items]:[];
+  const entries=items.map(it=>it.webkitGetAsEntry&&it.webkitGetAsEntry()).filter(Boolean);
+  if(!entries.length) return [...dt.files];
+  const out=[]; await Promise.all(entries.map(en=>walkEntry(en,out))); return out;
+}
+function walkEntry(entry,out){
+  return new Promise(res=>{
+    if(entry.isFile){ entry.file(f=>{out.push(f);res();},()=>res()); }
+    else if(entry.isDirectory){
+      const rd=entry.createReader(); const kids=[];
+      const rb=()=>rd.readEntries(ents=>{ if(!ents.length){Promise.all(kids.map(k=>walkEntry(k,out))).then(res);return;} kids.push(...ents); rb(); },()=>res());
+      rb();
+    } else res();
+  });
+}
+
+$("go").onclick=async()=>{
+  if(!picked.length) return;
+  $("go").disabled=true; msg(`Building combined Excel from ${picked.length} PDF(s)…`,"work");
+  const fd=new FormData();
+  picked.forEach(f=>fd.append("files",f,f.name));
+  try{
+    const r=await fetch("/api/delinquency/export",{method:"POST",body:fd});
+    if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.detail||"Failed.");}
+    const blob=await r.blob();
+    const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+    a.download="aged-delinquency.xlsx"; a.click(); URL.revokeObjectURL(a.href);
+    msg("Done — aged-delinquency.xlsx downloaded.","ok");
+  }catch(e){ msg(e.message,"bad"); }
+  $("go").disabled=false;
+};
+</script>
+</body></html>

@@ -366,6 +366,54 @@ async def convert_batch(files: list[UploadFile] = File(...),
     )
 
 
+@app.post("/api/delinquency/export")
+async def delinquency_export(files: list[UploadFile] = File(...)):
+    """Fold a whole folder of MRI 'Aged Delinquencies' PDFs (one property each)
+    into a single combined workbook, matching the analyst's Working.xls layout.
+    No auth — pure file-in/file-out."""
+    from .delinquency import build_combined_xlsx, parse
+
+    def _run(payload: list[tuple[str, bytes]]) -> bytes:
+        import tempfile
+        props = []
+        for fname, data in payload:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+                f.write(data)
+                tmp = f.name
+            try:
+                props.append(parse(tmp, fname))
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        return build_combined_xlsx(props)
+
+    payload: list[tuple[str, bytes]] = []
+    for uf in files:
+        if not uf.filename or not uf.filename.lower().endswith(".pdf"):
+            continue
+        b = await uf.read()
+        if b[:5] != b"%PDF-":
+            continue
+        payload.append((uf.filename, b))
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid PDFs in the upload.")
+
+    # Deterministic order — property blocks stack in filename order.
+    payload.sort(key=lambda t: t[0].lower())
+    try:
+        xlsx = await run_in_threadpool(_run, payload)
+    except Exception as e:
+        log.exception("delinquency export failed")
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {e}") from e
+    return StreamingResponse(
+        io.BytesIO(xlsx),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="aged-delinquency.xlsx"'},
+    )
+
+
 @app.post("/api/ar/convert")
 async def ar_convert(file: UploadFile = File(...)):
     """Upload an A/R Aging PDF, get the template-formatted .xlsx. No auth — this
@@ -753,6 +801,10 @@ if WEB.exists():
     @app.get("/tablescrape")
     def tablescrape_page() -> FileResponse:
         return FileResponse(str(WEB / "tablescrape.html"))
+
+    @app.get("/delinquency")
+    def delinquency_page() -> FileResponse:
+        return FileResponse(str(WEB / "delinquency.html"))
 
     @app.get("/usage")
     def usage_page() -> FileResponse:
