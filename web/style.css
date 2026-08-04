@@ -1366,20 +1366,69 @@ footer {
 }
 
 
-/* ---- Batch file bar (per-PDF customization in convert/split editors) ---- */
-.batch-bar{ display:flex; align-items:center; gap:8px; flex-wrap:wrap;
-  padding:10px 0 4px; border-bottom:1px solid rgba(255,255,255,.06); margin-bottom:8px; }
-.batch-bar .bb-label{ font-size:11px; text-transform:uppercase; letter-spacing:.5px;
-  color:var(--muted,#8a8576); margin-right:2px; }
-.batch-bar .bb-files{ display:flex; gap:6px; overflow-x:auto; flex:1; padding-bottom:2px; }
-.bb-chip{ display:inline-flex; align-items:center; gap:6px; white-space:nowrap;
-  padding:6px 10px; border-radius:8px; border:1px solid #333748; background:#1d1f2b;
-  color:#d9d5c8; font-size:12px; cursor:pointer; max-width:190px; }
-.bb-chip .nm{ overflow:hidden; text-overflow:ellipsis; }
-.bb-chip.active{ border-color:var(--gold,#c9a15a); background:#26283a; color:#f1eee7; }
-.bb-chip .tag{ font-size:9.5px; text-transform:uppercase; letter-spacing:.4px;
-  background:#3a2f12; color:#e0bd72; border-radius:10px; padding:1px 6px; }
-.bb-chip.active .tag{ background:#c9a15a; color:#1a1206; }
-.bb-apply{ font-size:11px; padding:5px 10px; border-radius:8px; border:1px solid #333748;
-  background:#1d1f2b; color:#e7e3d8; cursor:pointer; white-space:nowrap; }
-.bb-apply:hover{ border-color:var(--gold,#c9a15a); }
+/* ---- Batch side panel: the folder's PDFs listed beside the editor ---- */
+/* In batch mode the page widens and the card becomes [panel | editor]. */
+body.batch-mode main { max-width: 1280px; }
+
+.card.has-panel{
+  display:grid;
+  grid-template-columns: 232px minmax(0,1fr);
+  gap: 0 26px;
+  align-items:start;
+}
+.card.has-panel > *:not(.batch-panel){ grid-column:2; }
+
+.batch-panel{
+  grid-column:1; grid-row:1 / span 99;
+  align-self:stretch;
+  border-right:1px solid rgba(255,255,255,.07);
+  padding-right:18px;
+  position:sticky; top:24px;
+  max-height:calc(100vh - 60px);
+  display:flex; flex-direction:column; min-height:0;
+}
+.batch-panel .bp-head{
+  font-size:11px; text-transform:uppercase; letter-spacing:.6px;
+  color:var(--muted,#8a8576); display:flex; align-items:center; gap:6px;
+  margin:2px 0 10px;
+}
+.batch-panel .bp-count{
+  background:#23364f; color:#9ec5ff; border-radius:20px; padding:1px 8px; font-size:10.5px;
+}
+.batch-panel .bp-list{ overflow-y:auto; flex:1; min-height:0; margin:0 -4px; padding:0 4px 4px; }
+
+.bp-item{
+  display:flex; align-items:flex-start; gap:9px; width:100%; text-align:left;
+  padding:9px 10px; margin-bottom:6px; border-radius:10px; cursor:pointer;
+  border:1px solid #262936; background:#171823; color:#c8c3b6;
+  font:inherit; font-size:12.5px; line-height:1.35;
+}
+.bp-item:hover{ border-color:#3d4256; background:#1b1c28; }
+.bp-item.active{ border-color:var(--gold,#c9a15a); background:#22232f; color:#f1eee7; }
+.bp-item .idx{
+  flex:none; width:19px; height:19px; border-radius:5px; background:#2a2d3b; color:#9a9485;
+  font-size:10.5px; display:grid; place-items:center; margin-top:1px;
+}
+.bp-item.active .idx{ background:var(--gold,#c9a15a); color:#1a1206; }
+.bp-item .body{ min-width:0; flex:1; }
+.bp-item .nm{ display:block; overflow-wrap:anywhere; }
+.bp-item .sub{ display:block; margin-top:3px; font-size:10.5px; color:#7a7585; }
+.bp-item.custom .sub{ color:#e0bd72; }
+
+.batch-panel .bp-apply{
+  margin-top:10px; width:100%; font-size:11.5px; padding:8px 10px; border-radius:9px;
+  border:1px solid #333748; background:#1d1f2b; color:#e7e3d8; cursor:pointer;
+}
+.batch-panel .bp-apply:hover{ border-color:var(--gold,#c9a15a); }
+
+@media (max-width: 900px){
+  body.batch-mode main{ max-width:940px; }
+  .card.has-panel{ display:block; }
+  .card.has-panel > *:not(.batch-panel){ grid-column:auto; }
+  .batch-panel{
+    position:static; max-height:none; border-right:0; padding-right:0;
+    border-bottom:1px solid rgba(255,255,255,.07); padding-bottom:12px; margin-bottom:14px;
+  }
+  .batch-panel .bp-list{ display:flex; gap:8px; overflow-x:auto; }
+  .bp-item{ margin-bottom:0; min-width:190px; }
+}

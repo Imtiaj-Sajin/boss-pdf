@@ -178,6 +178,8 @@ function resetAll() {
   splitMode = "ranges";
   batchCfg = [];
   activeIdx = 0;
+  document.body.classList.remove("batch-mode");
+  [converterEl, splitterEl].forEach(el => el && el.classList.remove("has-panel"));
   convThumbs.innerHTML = "";
   splitThumbs.innerHTML = "";
   sectionListEl.innerHTML = "";
@@ -372,23 +374,45 @@ function buildPerFileMap() {
   return per;
 }
 
+// Side panel listing every PDF in the folder, beside the editor. Clicking one
+// loads it into the editor so its ranges/pages can be set individually.
 function renderBatchBar() {
-  const bar = document.getElementById(batchTool === "split" ? "splitBatchBar" : "convBatchBar");
-  const other = document.getElementById(batchTool === "split" ? "convBatchBar" : "splitBatchBar");
+  const split = batchTool === "split";
+  const panel = document.getElementById(split ? "splitBatchBar" : "convBatchBar");
+  const other = document.getElementById(split ? "convBatchBar" : "splitBatchBar");
+  const card = split ? splitterEl : converterEl;
+  const otherCard = split ? converterEl : splitterEl;
   if (other) hide(other);
-  if (!bar) return;
-  if (!inBatch() || batchFiles.length < 2) { hide(bar); return; }
-  show(bar);
+  if (otherCard) otherCard.classList.remove("has-panel");
+  if (!panel) return;
+
+  if (!inBatch() || batchFiles.length < 2) {
+    hide(panel);
+    if (card) card.classList.remove("has-panel");
+    document.body.classList.remove("batch-mode");
+    return;
+  }
+  show(panel);
+  if (card) card.classList.add("has-panel");
+  document.body.classList.add("batch-mode");
+
   const esc = s => (s || "").replace(/[&<>"]/g, "");
-  const chips = batchFiles.map((f, i) => {
-    const tag = isCustomized(i) ? `<span class="tag">custom</span>` : "";
-    const cls = "bb-chip" + (i === activeIdx ? " active" : "");
-    return `<button type="button" class="${cls}" data-bidx="${i}" title="${esc(f.name)}"><span class="nm">${esc(f.name)}</span>${tag}</button>`;
+  const items = batchFiles.map((f, i) => {
+    const custom = isCustomized(i);
+    const cls = "bp-item" + (i === activeIdx ? " active" : "") + (custom ? " custom" : "");
+    const sub = custom ? "custom settings"
+      : (i === activeIdx ? `${pageCount} page${pageCount === 1 ? "" : "s"}` : fmtSize(f.size));
+    return `<button type="button" class="${cls}" data-bidx="${i}" title="${esc(f.name)}">` +
+           `<span class="idx">${i + 1}</span>` +
+           `<span class="body"><span class="nm">${esc(f.name)}</span>` +
+           `<span class="sub">${esc(sub)}</span></span></button>`;
   }).join("");
-  bar.innerHTML =
-    `<span class="bb-label">PDFs</span><div class="bb-files">${chips}</div>` +
-    `<button type="button" class="bb-apply" id="bbApply">Apply this one to all</button>`;
-  bar.querySelectorAll(".bb-chip").forEach(el =>
+
+  panel.innerHTML =
+    `<div class="bp-head">PDFs <span class="bp-count">${batchFiles.length}</span></div>` +
+    `<div class="bp-list">${items}</div>` +
+    `<button type="button" class="bp-apply" id="bbApply">Apply this one to all</button>`;
+  panel.querySelectorAll(".bp-item").forEach(el =>
     el.addEventListener("click", () => switchBatchFile(parseInt(el.dataset.bidx, 10))));
   const ap = document.getElementById("bbApply");
   if (ap) ap.addEventListener("click", applyToAllFiles);
