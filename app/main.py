@@ -383,6 +383,52 @@ async def convert_batch(files: list[UploadFile] = File(...),
     )
 
 
+@app.post("/api/ledger/export")
+async def ledger_export(files: list[UploadFile] = File(...)):
+    """Receivables Ledger PDF(s) -> Excel. Tenant identity per block, then each
+    summary charge code with its Charges amount. No auth — file in/file out."""
+    from .ledger import build_xlsx, parse
+
+    def _run(payload: list[tuple[str, bytes]]) -> tuple[bytes, int]:
+        import tempfile
+        rows = []
+        for _fname, data in payload:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+                f.write(data)
+                tmp = f.name
+            try:
+                rows.extend(parse(tmp))
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        return build_xlsx(rows)
+
+    payload: list[tuple[str, bytes]] = []
+    for uf in files:
+        if not uf.filename or not uf.filename.lower().endswith(".pdf"):
+            continue
+        b = await uf.read()
+        if b[:5] != b"%PDF-":
+            continue
+        payload.append((uf.filename, b))
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid PDFs in the upload.")
+    payload.sort(key=lambda t: t[0].lower())
+    try:
+        xlsx, n = await run_in_threadpool(_run, payload)
+    except Exception as e:
+        log.exception("ledger export failed")
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {e}") from e
+    return StreamingResponse(
+        io.BytesIO(xlsx),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="rec-ledger.xlsx"',
+                 "X-Ledger-Rows": str(n)},
+    )
+
+
 @app.post("/api/delinquency/export")
 async def delinquency_export(files: list[UploadFile] = File(...)):
     """Fold a whole folder of MRI 'Aged Delinquencies' PDFs (one property each)
@@ -828,6 +874,10 @@ if WEB.exists():
     @app.get("/delinquency")
     def delinquency_page() -> FileResponse:
         return FileResponse(str(WEB / "delinquency.html"))
+
+    @app.get("/ledger")
+    def ledger_page() -> FileResponse:
+        return FileResponse(str(WEB / "ledger.html"))
 
     @app.get("/usage")
     def usage_page() -> FileResponse:
