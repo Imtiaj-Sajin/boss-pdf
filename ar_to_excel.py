@@ -145,6 +145,79 @@ def _lines(page):
     return [sorted(rows[t], key=lambda w: w["x0"]) for t in sorted(rows)]
 
 
+# How each aging column can be spelled in the header row.
+#
+# pdfplumber splits the header into words, and how it splits depends on the
+# glyph spacing of the particular report: "1-30" may arrive as three tokens
+# ("1", "-", "30"), as one merged token ("1-30"), or with an en-dash. The old
+# code only handled the split form and indexed the result unconditionally, so
+# ANY other spelling produced `list indices must be integers or slices, not
+# NoneType` — an opaque failure that said nothing about which column was at
+# fault.
+#
+# `single` = whole label in one token. `pair` = two tokens to straddle, with the
+# second searched AFTER the first so the "120" in "91-120" can't be mistaken for
+# the one in "Over 120".
+_BUCKET_SPELLINGS = {
+    "Current": {"single": ("Current", "CURRENT"), "pair": None},
+    "1-30":    {"single": ("1-30", "1–30", "0-30", "0–30"),      "pair": ("1", "30")},
+    "31-60":   {"single": ("31-60", "31–60"),                    "pair": ("31", "60")},
+    "61-90":   {"single": ("61-90", "61–90"),                    "pair": ("61", "90")},
+    "91-120":  {"single": ("91-120", "91–120"),                  "pair": ("91", "120")},
+    "Over120": {"single": ("Over120", "Over-120", "Over–120", "120+", "121+", ">120"),
+                "pair": ("Over", "120")},
+}
+
+
+def _buckets_by_position(toks):
+    """Locate the five non-Current aging columns geometrically.
+
+    Used only when the header text is too mangled to match (see the caller).
+    Everything between the "Current" and "Remark" headers belongs to those five
+    columns, so the tokens are split at the four widest horizontal gaps — the
+    gaps BETWEEN columns are far larger than those between the glyphs of one
+    label ("1", "-", "30"), whatever the digits came out as.
+
+    Returns {} rather than guessing if the line doesn't have the expected
+    shape; the caller then raises with the header row it actually read.
+    """
+    texts = [t for t, _ in toks]
+    try:
+        i_cur = texts.index("Current")
+    except ValueError:
+        return {}
+    i_rem = next((i for i in range(i_cur + 1, len(toks)) if texts[i] == "Remark"), len(toks))
+
+    span = list(range(i_cur + 1, i_rem))
+    keys = [k for k in BUCKET_KEYS if k != "Current"]
+    # Need at least one token per column to split at all.
+    if len(span) < len(keys):
+        return {}
+
+    gaps = sorted(
+        ((toks[span[i + 1]][1] - toks[span[i]][1], i) for i in range(len(span) - 1)),
+        reverse=True,
+    )
+    # Four cuts make five groups. Any fewer and the shape isn't what we expect.
+    cuts = sorted(i for _, i in gaps[: len(keys) - 1])
+    if len(cuts) != len(keys) - 1:
+        return {}
+
+    groups, start = [], 0
+    for c in cuts + [len(span) - 1]:
+        groups.append(span[start:c + 1])
+        start = c + 1
+    if len(groups) != len(keys) or any(not g for g in groups):
+        return {}
+
+    # Centre of a column = midpoint of its first and last glyph, matching how
+    # the text-matched path averages the two ends of "1" … "30".
+    return {
+        key: (toks[g[0]][1] + toks[g[-1]][1]) / 2
+        for key, g in zip(keys, groups)
+    }
+
+
 def _header_geometry(line):
     toks = [(w["text"], _cx(w)) for w in line]
 
@@ -154,16 +227,59 @@ def _header_geometry(line):
                 return i
         return None
 
-    def mid(i, j):
-        return (toks[i][1] + toks[j][1]) / 2
-
     centers = {}
-    i_cur = find("Current"); centers["Current"] = toks[i_cur][1]
-    i1 = find("1", i_cur); centers["1-30"] = mid(i1, find("30", i1))
-    i31 = find("31"); centers["31-60"] = mid(i31, find("60", i31))
-    i61 = find("61"); centers["61-90"] = mid(i61, find("90", i61))
-    i91 = find("91"); centers["91-120"] = mid(i91, find("120", i91))
-    io = find("Over"); centers["Over120"] = mid(io, find("120", io))
+    missing = []
+    # Columns run left to right, so each search starts after the previous
+    # column's last token. That ordering is what stops a bare "1" elsewhere on
+    # the line from being mistaken for the start of the 1-30 header.
+    cursor = 0
+    for key in BUCKET_KEYS:
+        spec = _BUCKET_SPELLINGS[key]
+
+        idx = next((i for i in (find(s, cursor) for s in spec["single"]) if i is not None), None)
+        if idx is not None:
+            centers[key] = toks[idx][1]
+            cursor = idx + 1
+            continue
+
+        if spec["pair"]:
+            a, b = spec["pair"]
+            ia = find(a, cursor)
+            ib = find(b, ia + 1) if ia is not None else None
+            if ia is not None and ib is not None:
+                centers[key] = (toks[ia][1] + toks[ib][1]) / 2
+                cursor = ib + 1
+                continue
+
+        missing.append(key)
+
+    if missing:
+        # Fall back to reading the columns by POSITION rather than by text.
+        #
+        # Some reports render the header so that the digits don't survive word
+        # extraction at all — one real file comes through as
+        #   "... Current  1 - 0  1 - 0  1 - 0  1 - 0  Over 0  Remark"
+        # where every multi-digit number has lost its leading digits. No
+        # spelling table can match that, but the LAYOUT is still intact: this
+        # report always has Current, then four aging columns, then the Over
+        # column, then Remark, in that order. So anchor on Current and Remark —
+        # which do survive, and are how the header line was identified in the
+        # first place — and split what lies between them into five columns.
+        positional = _buckets_by_position(toks)
+        if positional:
+            centers.update(positional)
+            missing = [k for k in BUCKET_KEYS if k not in centers]
+
+    if missing:
+        # Name the columns and show the header row as it was actually read, so
+        # this is fixable by adding a spelling above rather than by guessing.
+        # Only column titles appear here — no tenant, amount or remark data.
+        raise ValueError(
+            "Could not find the aging column header(s): " + ", ".join(missing)
+            + ". The header row was read as: " + " ".join(t for t, _ in toks)
+            + ". If the report words these columns differently, add that spelling"
+              " to _BUCKET_SPELLINGS in ar_to_excel.py."
+        )
     # Anchor the remark column on the LEFT edge (x0) of the 'Remark' header, not
     # its center — otherwise the threshold sits too far right and short
     # continuation words (e.g. a lone 'RENT') whose center falls left of it get
